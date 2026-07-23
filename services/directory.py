@@ -16,69 +16,94 @@ import difflib
 FAP_DIRECTORY = [
     {"id": "KNP-01", "name": "Kisan Sewa Kendra – Bilhaur", "district": "Kanpur Nagar",
      "town": "Bilhaur", "landmark": "near the tehsil chauraha, Bilhaur–Kanpur road",
-     "aliases": ["bilhaur"]},
+     "aliases": ["bilhaur", "बिलहौर", "बिल्हौर"]},
     {"id": "KNP-02", "name": "Kisan Sewa Kendra – Ghatampur", "district": "Kanpur Nagar",
      "town": "Ghatampur", "landmark": "opposite the mandi samiti gate",
-     "aliases": ["ghatampur"]},
+     "aliases": ["ghatampur", "घाटमपुर"]},
     {"id": "KND-01", "name": "Kisan Sewa Kendra – Akbarpur", "district": "Kanpur Dehat",
      "town": "Akbarpur", "landmark": "on the Kanpur–Kalyanpur road, near the block office",
-     "aliases": ["akbarpur"]},
+     "aliases": ["akbarpur", "अकबरपुर"]},
     {"id": "LKO-01", "name": "Kisan Sewa Kendra – Malihabad", "district": "Lucknow",
      "town": "Malihabad", "landmark": "near the mango mandi, Malihabad crossing",
-     "aliases": ["malihabad"]},
+     "aliases": ["malihabad", "मलिहाबाद"]},
     {"id": "LKO-02", "name": "Kisan Sewa Kendra – Mohanlalganj", "district": "Lucknow",
      "town": "Mohanlalganj", "landmark": "on the Lucknow–Raebareli road",
-     "aliases": ["mohanlalganj"]},
+     "aliases": ["mohanlalganj", "मोहनलालगंज"]},
     {"id": "UNO-01", "name": "Kisan Sewa Kendra – Purwa", "district": "Unnao",
      "town": "Purwa", "landmark": "near the tehsil office, Purwa",
-     "aliases": ["purwa"]},
+     "aliases": ["purwa", "पुरवा"]},
     {"id": "HRD-01", "name": "Kisan Sewa Kendra – Sandila", "district": "Hardoi",
      "town": "Sandila", "landmark": "on the Lucknow–Hardoi highway",
-     "aliases": ["sandila", "sandeela"]},
+     "aliases": ["sandila", "sandeela", "सांडीला", "सांडी"]},
     {"id": "STP-01", "name": "Kisan Sewa Kendra – Biswan", "district": "Sitapur",
      "town": "Biswan", "landmark": "near the Biswan bus stand",
-     "aliases": ["biswan"]},
+     "aliases": ["biswan", "बिसवां", "बीसवां"]},
     {"id": "BBK-01", "name": "Kisan Sewa Kendra – Zaidpur", "district": "Barabanki",
      "town": "Zaidpur", "landmark": "opposite the Zaidpur grain market",
-     "aliases": ["zaidpur"]},
+     "aliases": ["zaidpur", "जैदपुर"]},
     {"id": "BBK-02", "name": "Kisan Sewa Kendra – Barabanki", "district": "Barabanki",
      "town": "Barabanki", "landmark": "near the district collectorate road",
-     "aliases": ["barabanki town", "barabanki city"]},
+     "aliases": ["barabanki town", "barabanki city", "बाराबंकी"]},
     {"id": "AYO-01", "name": "Kisan Sewa Kendra – Sohawal", "district": "Ayodhya",
      "town": "Sohawal", "landmark": "on the Ayodhya–Sohawal road",
-     "aliases": ["sohawal", "faizabad sohawal"]},
+     "aliases": ["sohawal", "faizabad sohawal", "सोहावल"]},
     {"id": "AYO-02", "name": "Kisan Sewa Kendra – Ayodhya", "district": "Ayodhya",
      "town": "Ayodhya", "landmark": "near the Ayodhya bypass, Rae Bareli road side",
-     "aliases": ["ayodhya town", "faizabad"]},
+     "aliases": ["ayodhya town", "faizabad", "अयोध्या", "फैज़ाबाद", "फैजाबाद"]},
     {"id": "RBL-01", "name": "Kisan Sewa Kendra – Unchahar", "district": "Raebareli",
      "town": "Unchahar", "landmark": "near the Unchahar railway station road",
-     "aliases": ["unchahar"]},
+     "aliases": ["unchahar", "ऊंचाहार", "उंचाहार"]},
     {"id": "PTG-01", "name": "Kisan Sewa Kendra – Kunda", "district": "Pratapgarh",
      "town": "Kunda", "landmark": "near the Kunda tehsil gate",
-     "aliases": ["kunda"]},
+     "aliases": ["kunda", "कुंडा"]},
     {"id": "FTP-01", "name": "Kisan Sewa Kendra – Bindki", "district": "Fatehpur",
      "town": "Bindki", "landmark": "on the Fatehpur–Bindki road",
-     "aliases": ["bindki"]},
+     "aliases": ["bindki", "बिंदकी", "बिन्दकी"]},
     {"id": "AUR-01", "name": "Kisan Sewa Kendra – Bidhuna", "district": "Auraiya",
      "town": "Bidhuna", "landmark": "near the Bidhuna block office",
-     "aliases": ["bidhuna"]},
+     "aliases": ["bidhuna", "बिधुना"]},
     {"id": "KNJ-01", "name": "Kisan Sewa Kendra – Chhibramau", "district": "Kannauj",
      "town": "Chhibramau", "landmark": "near the Chhibramau grain mandi",
-     "aliases": ["chhibramau", "chibramau"]},
+     "aliases": ["chhibramau", "chibramau", "छिबरामऊ"]},
     {"id": "FBD-01", "name": "Kisan Sewa Kendra – Kaimganj", "district": "Farrukhabad",
      "town": "Kaimganj", "landmark": "on the Farrukhabad–Kaimganj road",
-     "aliases": ["kaimganj"]},
+     "aliases": ["kaimganj", "कायमगंज"]},
     {"id": "ETW-01", "name": "Kisan Sewa Kendra – Jaswantnagar", "district": "Etawah",
      "town": "Jaswantnagar", "landmark": "near the Jaswantnagar bus stand",
-     "aliases": ["jaswantnagar"]},
+     "aliases": ["jaswantnagar", "जसवंतनगर"]},
 ]
 
+# Devanagari forms of each served district — Hindi-language calls (this scenario's default)
+# can produce a find_nearest_fap(place=...) call in EITHER script depending on how the model
+# renders the conversation, so district lookup must work in both, not just Roman script.
+_DISTRICT_HI = {
+    "Kanpur Nagar": ["कानपुर नगर", "कानपुर"],
+    "Kanpur Dehat": ["कानपुर देहात"],
+    "Lucknow": ["लखनऊ"],
+    "Unnao": ["उन्नाव"],
+    "Hardoi": ["हरदोई"],
+    "Sitapur": ["सीतापुर"],
+    "Barabanki": ["बाराबंकी"],
+    "Ayodhya": ["अयोध्या", "फैज़ाबाद", "फैजाबाद"],
+    "Raebareli": ["रायबरेली"],
+    "Pratapgarh": ["प्रतापगढ़", "प्रतापगढ"],
+    "Fatehpur": ["फ़तेहपुर", "फतेहपुर"],
+    "Auraiya": ["औरैया"],
+    "Kannauj": ["कन्नौज"],
+    "Farrukhabad": ["फ़र्रुख़ाबाद", "फर्रुखाबाद"],
+    "Etawah": ["इटावा"],
+}
+
 # A few well-known UP districts we DON'T serve, mapped to the nearest district we DO — used only
-# as a fallback hint when a caller names a place outside our footprint entirely.
+# as a fallback hint when a caller names a place outside our footprint entirely. Both scripts.
 NEARBY_DISTRICT_HINT = {
     "lakhimpur kheri": "Sitapur", "shahjahanpur": "Hardoi", "mainpuri": "Etawah",
     "kaushambi": "Fatehpur", "amethi": "Raebareli", "sultanpur": "Ayodhya",
     "ambedkar nagar": "Ayodhya", "kanpur": "Kanpur Nagar", "faizabad": "Ayodhya",
+    "लखीमपुर खीरी": "Sitapur", "शाहजहाँपुर": "Hardoi", "शाहजहांपुर": "Hardoi",
+    "मैनपुरी": "Etawah", "कौशाम्बी": "Fatehpur", "कौशांबी": "Fatehpur",
+    "अमेठी": "Raebareli", "सुल्तानपुर": "Ayodhya", "अम्बेडकर नगर": "Ayodhya",
+    "अंबेडकर नगर": "Ayodhya",
 }
 
 
@@ -93,6 +118,11 @@ for _fap in FAP_DIRECTORY:
     _TOWN_INDEX[_normalize(_fap["town"])] = _fap
     for _alias in _fap.get("aliases", []):
         _TOWN_INDEX[_normalize(_alias)] = _fap
+# Devanagari district names point at the SAME fap list as their English key.
+for _dist_en, _dist_hi_forms in _DISTRICT_HI.items():
+    _faps_for_dist = _DISTRICT_INDEX.get(_normalize(_dist_en), [])
+    for _form in _dist_hi_forms:
+        _DISTRICT_INDEX[_normalize(_form)] = _faps_for_dist
 
 _SERVED_DISTRICTS = sorted({fap["district"] for fap in FAP_DIRECTORY})
 
