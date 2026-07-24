@@ -24,8 +24,8 @@ GOSTHI_CASE = {
     "district": "Kanpur Nagar",
     "crop": "paddy",
     "crop_hi": "धान",
-    "date_en": "Sunday, 2 August",
-    "date_hi": "रविवार, दो अगस्त",
+    "date_en": "Tuesday, 28 July",
+    "date_hi": "मंगलवार, अट्ठाईस जुलाई",
     "time": "10 AM",
     "time_hi": "सुबह दस बजे",
     "location": "the Kisan Sewa Kendra FAP in Bilhaur",
@@ -65,12 +65,12 @@ LANG_NAME = {"english": "English", "hindi": "Hindi"}
 # The agent's FIRST line — delivered the instant the call connects, before any tool logic runs.
 OPENERS = {
     "sales": {
-        "english": "Hello! This is Meera at Kisan Sewa Kendra — how can I help you today?",
-        "hindi": "नमस्ते! मैं मीरा बोल रही हूँ, किसान सेवा केंद्र से — बताइए, क्या मदद कर सकती हूँ?",
+        "english": "Namaste sir! This is Meera at Kisan Sewa Kendra — how can I help you today?",
+        "hindi": "नमस्ते जी! मैं मीरा बोल रही हूँ, किसान सेवा केंद्र से — बताइए, क्या मदद कर सकती हूँ?",
     },
     "gosthi": {
-        "english": "Hello! This is Kavita calling from Kisan Sewa Kendra — am I speaking with Mahesh ji? How have you been?",
-        "hindi": "नमस्ते! मैं कविता बोल रही हूँ, किसान सेवा केंद्र से — क्या मेरी बात महेश जी से हो रही है? कैसे हैं आप?",
+        "english": "Namaste sir! This is Kavita calling from Kisan Sewa Kendra — am I speaking with Mahesh ji? How have you been?",
+        "hindi": "नमस्ते जी! मैं कविता बोल रही हूँ, किसान सेवा केंद्र से — क्या मेरी बात महेश जी से हो रही है? कैसे हैं आप?",
     },
 }
 
@@ -207,6 +207,10 @@ STYLE — SHORT AND CRISP, LIKE A SHARP SALESPERSON:
   info, prices and locations..."), that is a help-menu, not how a person talks. Instead name
   2-3 REAL categories from your actual stock (e.g. "We've got fertiliser, seeds, pesticides,
   cattle feed and equipment — what are you looking for?") and hand it back to them.
+- RESPECTFUL ADDRESS: beyond the opener, call them 'sir' in English / 'जी' in Hindi a few more
+  times through the call — naturally, e.g. once on their main question and once near the close
+  — never on every line, never two honorifics stacked in one sentence. Rule #2's one-sentence
+  cap still applies.
 
 YOUR PRODUCT KNOWLEDGE (answer price/product/crop questions ONLY from this — never invent a
 product or a price that isn't here):

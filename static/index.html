@@ -314,7 +314,7 @@ let recog = null;                 // Web Speech fallback
 let pendingAudioMime = null, currentAudio = null;
 let typingEl = null;
 let httpMode = false, httpHistory = [];   // HTTP fallback when WebSocket is unavailable (e.g. Vercel)
-let noReplyTimer = null, noReplyCount = 0, endingCall = false, chatActive = false;
+let noReplyTimer = null, noReplyCount = 0, endingCall = false, chatActive = false, capabilityNudgeSent = false;
 // No-reply ladder: 3s → follow-up #1, 3s → follow-up #2, 3s → hang up AND record in the CRM.
 const NO_REPLY_MS = 3000, NO_REPLY_CHAT_MS = 8000;
 // ── Two axes: scenario (persona/tool) × language (what the agent speaks) ──
@@ -352,7 +352,7 @@ const SCENARIO_PACK = {
 // Auto-close + re-ask lines, per scenario × language (spoken when the caller stays silent).
 const ENDINGS = {
   sales: {
-    english:"Alright — thanks for calling, do visit the store! Have a great day!",
+    english:"Alright sir — thanks for calling, do visit the store! Have a great day!",
     hindi:"ठीक है जी — कॉल के लिए धन्यवाद, दुकान पर ज़रूर आइए! आपका दिन शुभ हो!",
   },
   gosthi: {
@@ -364,11 +364,20 @@ const REASKS = {
   english:"(System note — not from the customer: the line is silent. In ONE very short natural ENGLISH sentence, check they can hear you — use their name, like a real caller: 'Hello, can you hear me?' — or repeat your pending question in fewer words. Never the same line twice, never greet again, never mention this note — reply with ONLY that sentence.)",
   hindi:"(System note — not from the customer: the line is silent. In ONE very short natural HINDI sentence, check they can hear you — use their name, like a real caller: 'सुन पा रहे हैं जी?' — or repeat your pending question in fewer words. Never the same line twice, never greet again, never mention this note — reply with ONLY that sentence.)",
 };
+// Fires ONLY once, on the sales scenario's very first no-reply trigger (see followupNote()) —
+// proactively states what Meera can help with instead of a generic "can you hear me". Mirrors
+// the STYLE bullet in prompts.py's _prompt_sales() for a broad "what can you do" question —
+// same example line, so behaviour stays anchored to that guidance rather than diverging.
+const CAPABILITY_NUDGE = {
+  english:"(System note — not from the customer: they haven't said what they need yet, this early in the call. In ONE short natural ENGLISH sentence, proactively name 2-3 real categories from your stock and ask what they're looking for — e.g. 'We've got fertiliser, seeds, pesticides, cattle feed and equipment — what are you looking for?' Do NOT ask if they can hear you — this is not a connection check. Never the same line twice, never greet again, never mention this note — reply with ONLY that sentence.)",
+  hindi:"(System note — not from the customer: they haven't said what they need yet, this early in the call. In ONE short natural HINDI sentence, proactively name 2-3 real categories from your stock and ask what they're looking for — e.g. 'हमारे पास खाद, बीज, कीटनाशक और पशु आहार है — आपको क्या चाहिए जी?' Do NOT ask if they can hear you — this is not a connection check. Never the same line twice, never greet again, never mention this note — reply with ONLY that sentence.)",
+};
 function pack(){ return SCENARIO_PACK[sessionScenario] || SCENARIO_PACK.sales; }
 function langCode(){ return (LANGS[sessionLang] || LANGS.hindi).code; }
 function langLabel(){ return (LANGS[sessionLang] || LANGS.hindi).label; }
 function endingLine(){ return (ENDINGS[sessionScenario] || ENDINGS.sales)[sessionLang] || ENDINGS.sales.english; }
 function reaskNote(){ return REASKS[sessionLang] || REASKS.english; }
+function capabilityNote(){ return CAPABILITY_NUDGE[sessionLang] || CAPABILITY_NUDGE.english; }
 function hintNow(){ return pack().hints[sessionLang] || pack().hints[pack().default]; }
 
 // ── boot — no access gate; go straight to the scenario picker ─────────────────
@@ -385,7 +394,7 @@ $('btnScenes').onclick = ()=>location.reload();   // back to the picker
 function chooseScenario(s, l){
   sessionScenario = SCENARIO_PACK[s] ? s : 'sales';
   sessionLang = LANGS[l] ? l : pack().default;
-  openerData = null; turnsSent = 0; closeRequested = false; noReplyCount = 0; callOpened = false;
+  openerData = null; turnsSent = 0; closeRequested = false; noReplyCount = 0; callOpened = false; capabilityNudgeSent = false;
   chatActive = !!pack().chat;
   $('scenepick').style.display='none';
   const p = pack();
@@ -592,7 +601,13 @@ function armNoReply(){
   if(!sessionActive() || endingCall) return;
   noReplyTimer = setTimeout(handleNoReply, NO_REPLY_MS);
 }
-function followupNote(){ return reaskNote(); }
+function followupNote(){
+  if(sessionScenario==='sales' && noReplyCount===1 && !capabilityNudgeSent){
+    capabilityNudgeSent = true;
+    return capabilityNote();
+  }
+  return reaskNote();
+}
 // Even a silent conversation must land in the CRM — the close note makes the agent say one
 // last line AND log the outcome before hanging up. Note: the literal substring "CALL " below
 // is what forces function-calling on this turn (see llm.py's force_tool check) — the exact
@@ -651,7 +666,7 @@ function sysNote(t){
   $('convo').appendChild(d); $('convo').scrollTop=$('convo').scrollHeight;
 }
 function endCall(){
-  endingCall=false; noReplyCount=0; closeRequested=false; clearNoReply(); clearAudioQueue();
+  endingCall=false; noReplyCount=0; closeRequested=false; capabilityNudgeSent=false; clearNoReply(); clearAudioQueue();
   if(listening){
     listening=false; stopMic(); stopRecog();
     $('btnStart').classList.remove('on'); $('btnStart').textContent=pack().startLabel||'📞 Start call';
@@ -752,7 +767,7 @@ function _unlockAudio(){
 async function startTalking(){
   if(listening) return;
   _unlockAudio();
-  endingCall=false; noReplyCount=0; closeRequested=false; clearNoReply();
+  endingCall=false; noReplyCount=0; closeRequested=false; capabilityNudgeSent=false; clearNoReply();
   await ensureWS();
   listening=true;
   $('btnStart').classList.add('on'); $('btnStart').textContent='● On call';
@@ -767,7 +782,7 @@ async function startTalking(){
 
 function stopTalking(){
   listening=false;
-  clearNoReply(); noReplyCount=0; endingCall=false; closeRequested=false;
+  clearNoReply(); noReplyCount=0; endingCall=false; closeRequested=false; capabilityNudgeSent=false;
   $('btnStart').classList.remove('on'); $('btnStart').textContent=pack().startLabel||'📞 Start call';
   $('btnStop').disabled=true;
   stopMic(); stopRecog();
@@ -777,7 +792,7 @@ function stopTalking(){
 }
 
 function restart(){
-  clearNoReply(); noReplyCount=0; endingCall=false; clearAudioQueue();
+  clearNoReply(); noReplyCount=0; endingCall=false; capabilityNudgeSent=false; clearAudioQueue();
   httpHistory=[]; turnsSent=0; closeRequested=false; callOpened=false;
   $('convo').querySelectorAll('.msg,.typing,.empty').forEach(n=>{ if(n.id!=='convoEmpty') n.remove(); });
   const e=$('convoEmpty'); if(e) e.style.display='';

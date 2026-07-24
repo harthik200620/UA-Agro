@@ -160,14 +160,14 @@ def _fallback_for(tool: str | None, args: dict | None, lang: str = "english") ->
                 "bulk_enquiry": "नोट कर लिया जी — टीम बल्क ऑर्डर पर बात करेगी।",
                 "complaint": "नोट कर लिया जी — टीम इसे देखेगी और आपसे संपर्क करेगी।",
                 "wrong_number": "कोई बात नहीं जी, परेशान करने के लिए माफ़ी!",
-                "off_topic": "किसान सेवा केंद्र को कॉल करने के लिए धन्यवाद!",
+                "off_topic": "किसान सेवा केंद्र को कॉल करने के लिए धन्यवाद जी!",
             }.get(outcome, "कॉल के लिए धन्यवाद जी — दुकान पर ज़रूर आइए!")
         return {
-            "bulk_enquiry": "Noted — our team will follow up on the bulk order.",
-            "complaint": "I've noted it — our team will look into this and get back to you.",
-            "wrong_number": "No problem, sorry to bother you!",
-            "off_topic": "Thanks for calling Kisan Sewa Kendra!",
-        }.get(outcome, "Thanks for calling — do visit the store!")
+            "bulk_enquiry": "Noted sir — our team will follow up on the bulk order.",
+            "complaint": "I've noted it, sir — our team will look into this and get back to you.",
+            "wrong_number": "No problem, sir — sorry to bother you!",
+            "off_topic": "Thanks for calling Kisan Sewa Kendra, sir!",
+        }.get(outcome, "Thanks for calling, sir — do visit the store!")
 
     if tool == "log_rsvp":
         outcome = str(a.get("outcome") or "").strip().lower()
