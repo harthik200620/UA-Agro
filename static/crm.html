@@ -12,17 +12,17 @@
 <link rel="apple-touch-icon" href="/static/verba_mark.png">
 <style>
   :root{
-    --paper:#EAEEF6; --card:#FFFFFF;
-    --glass:rgba(255,255,255,.56); --glass-strong:rgba(255,255,255,.80);
-    --glass-edge:rgba(255,255,255,.75);
-    --line:rgba(16,24,32,.10);
-    --ink:#0D1220; --muted:#48526A;
-    --brand:#4453F4; --brand-deep:#3038C4;
-    --green:#1F8F55; --alert:#D9544A; --rsvp:#D97706;
+    --paper:#F6F4F0; --paper2:#ECE7DF; --card:#FFFFFF;
+    --glass:rgba(255,255,255,.58); --glass-strong:rgba(255,255,255,.82);
+    --glass-edge:rgba(255,255,255,.72);
+    --line:rgba(24,20,38,.10);
+    --ink:#0A0A10; --muted:#524D61;
+    --brand:#3C46C7; --brand-deep:#242B85; --brand-soft:#6935C4;
+    --green:#1C7F4C; --alert:#B8443B; --rsvp:#AD6207;
     --ease:cubic-bezier(.16,1,.3,1);
-    --shadow-sm:0 1px 2px rgba(16,24,32,.06), 0 1px 1px rgba(16,24,32,.04);
-    --shadow-md:0 16px 38px rgba(28,32,90,.14), 0 3px 10px rgba(28,32,90,.06);
-    --shadow-lg:0 32px 76px rgba(20,22,64,.22), 0 10px 26px rgba(20,22,64,.09);
+    --shadow-sm:0 1px 3px rgba(20,15,40,.07), 0 1px 2px rgba(20,15,40,.04);
+    --shadow-md:0 20px 48px rgba(20,15,50,.12), 0 4px 14px rgba(20,15,50,.05);
+    --shadow-lg:0 36px 84px rgba(15,12,45,.20), 0 10px 28px rgba(15,12,45,.08);
   }
   *{box-sizing:border-box}
   html,body{margin:0;min-height:100%}
@@ -30,20 +30,22 @@
     font-family:'Poppins','Noto Sans Devanagari',system-ui,sans-serif;
     -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
     background-image:
-      radial-gradient(1000px 640px at -10% -16%, rgba(68,83,244,.38), transparent 58%),
-      radial-gradient(820px 580px at 108% -14%, rgba(124,58,237,.30), transparent 56%),
-      radial-gradient(780px 640px at 106% 106%, rgba(31,143,85,.28), transparent 55%),
-      radial-gradient(640px 460px at -8% 104%, rgba(31,143,85,.16), transparent 58%),
-      radial-gradient(1100px 780px at 50% 30%, rgba(255,255,255,.55), transparent 68%),
-      linear-gradient(180deg,#F8FAFD,#E6EAF3);
+      radial-gradient(1150px 760px at -14% -18%, rgba(60,70,199,.22), transparent 60%),
+      radial-gradient(950px 720px at 110% -12%, rgba(105,53,196,.17), transparent 58%),
+      radial-gradient(1050px 820px at 58% 108%, rgba(60,70,199,.09), transparent 62%),
+      linear-gradient(175deg,#F9F7F3,var(--paper2));
     background-attachment:fixed;
-    background-repeat:no-repeat}
+    background-repeat:no-repeat;
+    position:relative}
+  body::before{
+    content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.028;mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
   ::selection{background:var(--brand);color:#fff}
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px;border:2px solid var(--paper)}
   a:focus-visible, button:focus-visible{outline:2px solid var(--brand);outline-offset:2px;border-radius:8px}
-  .wrap{max-width:980px;margin:0 auto;padding:22px 20px 60px}
+  .wrap{max-width:980px;margin:0 auto;padding:22px 20px 60px;position:relative;z-index:1}
   header{display:flex;align-items:center;gap:16px;padding:12px 6px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
   .logo-img{height:42px;display:block;filter:drop-shadow(0 6px 14px rgba(40,48,140,.16))}
   .brand h1{font-family:'Fraunces',serif;font-weight:700;font-size:23px;margin:0;color:var(--ink);letter-spacing:-.01em}
@@ -51,9 +53,9 @@
   .live{margin-left:auto;display:flex;align-items:center;gap:8px;background:var(--glass);backdrop-filter:blur(16px) saturate(160%);-webkit-backdrop-filter:blur(16px) saturate(160%);border:1px solid var(--glass-edge);
     border-radius:999px;padding:8px 15px;font-size:12px;font-weight:700;color:var(--ink);box-shadow:var(--shadow-sm)}
   .live .dot{position:relative;width:10px;height:10px;border-radius:50%;
-    background:radial-gradient(circle at 32% 26%, #6EE8A8, var(--green) 62%, #146a43 100%);
-    box-shadow:0 0 0 0 rgba(31,143,85,.5);animation:pulse 1.6s var(--ease) infinite}
-  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(31,143,85,.45)}70%{box-shadow:0 0 0 9px rgba(31,143,85,0)}100%{box-shadow:0 0 0 0 rgba(31,143,85,0)}}
+    background:radial-gradient(circle at 32% 26%, #5FCB92, var(--green) 62%, #0E4227 100%);
+    box-shadow:0 0 0 0 rgba(28,127,76,.5);animation:pulse 1.6s var(--ease) infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(28,127,76,.45)}70%{box-shadow:0 0 0 9px rgba(28,127,76,0)}100%{box-shadow:0 0 0 0 rgba(28,127,76,0)}}
   .filters{display:flex;gap:9px;margin:18px 0 15px;flex-wrap:wrap}
   .fchip{font-family:inherit;font-size:12.5px;font-weight:700;border:1px solid var(--glass-edge);border-radius:999px;
     padding:8px 15px;background:var(--glass);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:var(--muted);cursor:pointer;
@@ -69,8 +71,8 @@
   .rec.flash{animation:flash 1.6s var(--ease)}
   @keyframes rise{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}
   @keyframes flash{0%{background:#FFF3DC}100%{background:var(--glass-strong)}}
-  .rec.enq{border-left-color:#8A8FF0}
-  .rec.enq .badge{background:#8A8FF0}
+  .rec.enq{border-left-color:var(--brand-soft)}
+  .rec.enq .badge{background:var(--brand-soft)}
   .rec.rsvp{border-left-color:var(--rsvp)}
   .rec.rsvp .badge{background:var(--rsvp)}
   .rec .top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
@@ -84,8 +86,8 @@
   .emptybox{margin:60px auto;text-align:center;color:var(--muted);font-size:14px;line-height:1.7;max-width:420px}
   .emptybox .big{font-family:'Fraunces',serif;font-size:20px;color:var(--ink);margin-bottom:6px}
   .emptybox .orb{position:relative;width:52px;height:52px;margin:0 auto 16px;border-radius:50%;
-    background:radial-gradient(circle at 32% 26%, #93A0FF, var(--brand) 55%, var(--brand-deep) 100%);
-    box-shadow:0 12px 28px rgba(68,83,244,.28), inset 0 -5px 10px rgba(0,0,0,.14), inset 0 3px 6px rgba(255,255,255,.4);
+    background:radial-gradient(circle at 32% 26%, #7E8AEA, var(--brand) 55%, var(--brand-deep) 100%);
+    box-shadow:0 12px 28px rgba(60,70,199,.30), inset 0 -5px 10px rgba(0,0,0,.14), inset 0 3px 6px rgba(255,255,255,.4);
     animation:heroBreathe 4.4s var(--ease) infinite}
   @keyframes heroBreathe{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
   a.back{font-size:12px;color:var(--brand-deep);font-weight:600;text-decoration:none;margin-left:14px}
