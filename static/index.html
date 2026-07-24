@@ -738,8 +738,20 @@ $('sens').addEventListener('input',e=>{
   $('sensval').textContent = v<0.012?'sensitive':(v>0.026?'quiet room':'normal');
 });
 
+// Playing (then discarding) ANY audio SYNCHRONOUSLY inside the click handler "spends" the
+// user gesture — that's what lets the LATER programmatic audio.play() calls (after the mic
+// permission prompt, network round-trips) actually play instead of being silently blocked by
+// mobile Safari/Chrome's autoplay policy once the gesture has "expired" across an await. Call
+// this FIRST, before any await, or it doesn't count.
+function _unlockAudio(){
+  try{
+    const a = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=');
+    a.play().catch(()=>{});
+  }catch(e){}
+}
 async function startTalking(){
   if(listening) return;
+  _unlockAudio();
   endingCall=false; noReplyCount=0; closeRequested=false; clearNoReply();
   await ensureWS();
   listening=true;
@@ -791,7 +803,15 @@ const MIN_COMPLETE_MS=700, FRAGMENT_WAIT_MS=1100;
 async function startMic(){
   try{
     micStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
-  }catch(e){ alert('Microphone permission is needed. You can still type to the agent.'); listening=false; $('btnStart').classList.remove('on'); $('btnStart').textContent=pack().startLabel||'📞 Start call'; $('btnStop').disabled=true; return; }
+  }catch(e){
+    // A blocking alert() here used to freeze the WHOLE call — on some mobile browsers
+    // (in-app WhatsApp/Instagram webviews especially) it can render off-screen or get missed
+    // entirely, and since it blocks the JS thread, the opener line after this in
+    // startTalking() never runs: no voice, no reply, the call just looks dead. Never block —
+    // show a dismissible note and let the call carry on in type-only mode.
+    sysNote('🎤 Microphone unavailable here — you can still type to the agent below.');
+    return;
+  }
   audioCtx = new (window.AudioContext||window.webkitAudioContext)();
   srate = audioCtx.sampleRate;
   await audioCtx.audioWorklet.addModule('/static/pcm-worklet.js');
