@@ -139,6 +139,8 @@
   .bk.enq .badge{background:var(--brand-soft)}
   .bk.rsvp{border-left-color:var(--rsvp)}
   .bk.rsvp .badge{background:var(--rsvp)}
+  .bk.issue{border-left-color:var(--alert)}
+  .bk.issue .badge{background:var(--alert)}
   .bk .top{display:flex;align-items:baseline;gap:8px}
   .bk .nm{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--ink)}
   .bk .badge{margin-left:auto;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#fff;background:var(--brand);border-radius:999px;padding:3px 9px;white-space:nowrap}
@@ -413,7 +415,6 @@ function chooseScenario(s, l){
   if(recog){ try{ recog.lang = langCode(); }catch(e){} }
   getOpening();   // prefetch the opener audio NOW — the call picks up instantly on Start
   init();
-  getOpening();   // warm the intro audio so the agent's first line plays instantly
 }
 
 async function init(){
@@ -429,15 +430,23 @@ async function init(){
 }
 
 // ── The agent speaks first — the opener line (audio cached server-side) ─────
-let openerData=null, turnsSent=0, callOpened=false;
+// In-flight dedup: without it, back-to-back prefetch calls each POST /api/opening before the
+// first resolves — concurrent synths of the SAME line can trip ElevenLabs' free-tier
+// 2-concurrent cap (429 + retry backoff right at call pickup).
+let openerData=null, openerPromise=null, turnsSent=0, callOpened=false;
 async function getOpening(){
   if(openerData) return openerData;
-  try{
-    const fd=new FormData(); fd.append('password', adminPw); fd.append('scenario', sessionScenario);
-    fd.append('lang', sessionLang);
-    openerData = await (await fetch('/api/opening',{method:'POST',body:fd})).json();
-  }catch(e){ openerData=null; }
-  return openerData;
+  if(openerPromise) return openerPromise;
+  openerPromise = (async()=>{
+    try{
+      const fd=new FormData(); fd.append('password', adminPw); fd.append('scenario', sessionScenario);
+      fd.append('lang', sessionLang);
+      openerData = await (await fetch('/api/opening',{method:'POST',body:fd})).json();
+    }catch(e){ openerData=null; }
+    openerPromise=null;
+    return openerPromise;
+  })();
+  return openerPromise;
 }
 
 function scheduleFiller(){}
@@ -455,6 +464,7 @@ const CRM_NAME = {
 const KIND_META = {
   enquiry: {label:'Enquiry', cls:'enq'},
   rsvp:    {label:'RSVP',    cls:'rsvp'},
+  issue:   {label:'Issue',   cls:'issue'},
 };
 function addCrmCard(r, quiet){
   if(!r || !r.id) return;
@@ -573,7 +583,14 @@ function connectWS(){
     const to=setTimeout(()=>reject(new Error('ws timeout')), 3500);
     ws.onopen=()=>{ clearTimeout(to); ws.send(JSON.stringify({type:'hello', password: adminPw, scenario: sessionScenario, lang: sessionLang})); resolve(); };
     ws.onerror=(e)=>{ clearTimeout(to); reject(e); };
-    ws.onclose=()=>{ };
+    // If the socket drops MID-CALL (serverless WS duration cap, flaky mobile network), never
+    // leave a zombie call that ignores the caller forever: end it visibly and cleanly.
+    ws.onclose=()=>{
+      if(listening && !endingCall){
+        sysNote('📴 Line dropped — call ended. Tap Start to call again.');
+        endCall();
+      }
+    };
     ws.onmessage=onWsMessage;
   });
 }
@@ -812,12 +829,15 @@ async function sendTyped(){
 
 // ── Mic capture (Sarvam path): AudioWorklet + energy VAD + WAV encode ─────────
 let capturing=false, speechFrames=[], preRoll=[], silentSamples=0, speechSamples=0, voicedSamples=0, srate=48000;
-const PREROLL_MS=300, SILENCE_END_MS=350, MIN_SPEECH_MS=300, MAX_TURN_MS=15000;
+// SILENCE_END 420 (was 350): a natural mid-sentence pause in Hindi speech was getting cut as
+// end-of-turn, truncating the utterance's tail. MIN_SPEECH 180 (was 300): real one-word
+// answers ("हाँ", "yes") were being discarded as non-speech.
+const PREROLL_MS=300, SILENCE_END_MS=420, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
 const MIN_COMPLETE_MS=700, FRAGMENT_WAIT_MS=1100;
 
 async function startMic(){
   try{
-    micStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+    micStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
   }catch(e){
     // A blocking alert() here used to freeze the WHOLE call — on some mobile browsers
     // (in-app WhatsApp/Instagram webviews especially) it can render off-screen or get missed
@@ -847,8 +867,36 @@ function stopMic(){
 let muteUntil=0;
 function armed(){ return listening && !waitingForServer && !playing && performance.now() > muteUntil; }
 
+// ── Streamed mic upload: ship audio to the server WHILE the caller is still speaking, so at
+// end-of-turn only the last ~250ms remains to send — the whole-utterance upload no longer sits
+// between "caller stopped" and "agent starts thinking". Frames are downsampled to 16k int16
+// client-side (same math as the batch path) and sent as WS binary between mic_start/mic_end.
+const STREAM_MIC = true;              // kill switch — false restores record-then-send
+const STREAM_CHUNK_MS = 250;
+let micStreamOpen=false, streamSent=0; // streamSent = how many source samples already shipped
+function pumpMicStream(flush){
+  const totalLen = speechFrames.reduce((a,c)=>a+c.length,0);
+  const pending = totalLen - streamSent;
+  if(pending <= 0) return;
+  if(!flush && pending < srate*STREAM_CHUNK_MS/1000) return;
+  if(!(ws && ws.readyState===1)){ micStreamOpen=false; return; }
+  const all=new Float32Array(pending); let o=0, skip=streamSent;
+  for(const f of speechFrames){
+    if(skip>=f.length){ skip-=f.length; continue; }
+    const part=skip? f.subarray(skip): f; skip=0;
+    all.set(part,o); o+=part.length;
+  }
+  streamSent = totalLen;
+  const i16 = floatTo16(downsample(all, srate, 16000));
+  ws.send(i16.buffer);
+}
 function onPcm(chunk){
-  if(!armed()){ return; }
+  // Keep the pre-roll ring FILLING whenever the mic is open and the agent isn't speaking —
+  // including the short post-playback mute window and while waiting on the server. Previously
+  // this returned on !armed(), so the mute window was a total dead zone: a caller who answered
+  // the moment the agent finished had their first words lost with no pre-roll to recover them.
+  // Capture TRIGGERING still requires armed() — only the buffering runs early.
+  if(playing || !listening){ return; }
   const n=chunk.length;
   let sum=0; for(let i=0;i<n;i++){ const s=chunk[i]; sum+=s*s; }
   const rms=Math.sqrt(sum/n);
@@ -861,13 +909,16 @@ function onPcm(chunk){
     preRoll.push(chunk);
     let total=preRoll.reduce((a,c)=>a+c.length,0);
     while(total>preMax && preRoll.length>1){ total-=preRoll.shift().length; }
-    if(rms>startT){
+    if(armed() && rms>startT){
       capturing=true; speechFrames=preRoll.slice(); preRoll=[];
       speechSamples=speechFrames.reduce((a,c)=>a+c.length,0); silentSamples=0; voicedSamples=0;
       clearNoReply();
+      micStreamOpen = STREAM_MIC && !httpMode && ws && ws.readyState===1;
+      if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000}); streamSent=0; }
     }
   }else{
     speechFrames.push(chunk); speechSamples+=n;
+    if(micStreamOpen) pumpMicStream(false);
     if(rms<silT){ silentSamples+=n; } else { silentSamples=0; voicedSamples+=n; }
     const voicedMs=voicedSamples/srate*1000;
     const endPauseMs=(voicedMs>=MIN_COMPLETE_MS)?SILENCE_END_MS:FRAGMENT_WAIT_MS;
@@ -878,19 +929,29 @@ function onPcm(chunk){
 function endTurn(){
   capturing=false;
   clearNoReply();
+  const streamed = micStreamOpen; micStreamOpen=false;
   const frames=speechFrames; speechFrames=[];
   const durMs = frames.reduce((a,c)=>a+c.length,0)/srate*1000;
   silentSamples=0; speechSamples=0; voicedSamples=0;
-  if(durMs<MIN_SPEECH_MS){ if(listening && !endingCall) armNoReply(); return; }
+  if(durMs<MIN_SPEECH_MS){
+    if(streamed) wsSend({type:'mic_abort'});   // server discards the partial buffer
+    if(listening && !endingCall) armNoReply();
+    return;
+  }
   noReplyCount=0;
-  let len=0; frames.forEach(f=>len+=f.length);
-  const all=new Float32Array(len); let o=0; frames.forEach(f=>{all.set(f,o);o+=f.length;});
-  const ds=downsample(all, srate, 16000);
-  const wav=encodeWAV(floatTo16(ds), 16000);
   waitingForServer=true;
   setPill('transcribing');
   if(turnsSent>0) scheduleFiller();
   turnsSent++;
+  if(streamed && ws && ws.readyState===1){
+    pumpMicStream(true);                        // ship the tail
+    wsSend({type:'mic_end', duration_ms:Math.round(durMs)});
+    return;
+  }
+  let len=0; frames.forEach(f=>len+=f.length);
+  const all=new Float32Array(len); let o=0; frames.forEach(f=>{all.set(f,o);o+=f.length;});
+  const ds=downsample(all, srate, 16000);
+  const wav=encodeWAV(floatTo16(ds), 16000);
   if(httpMode){ postTurn({wav: wav}); return; }
   if(ws&&ws.readyState===1){
     ws.send(JSON.stringify({type:'turn_meta',format:'wav',sample_rate:16000,duration_ms:Math.round(durMs)}));
@@ -974,7 +1035,10 @@ function endOfStream(){
   if(!qActive && audioQ.length===0){ playing=false; afterPlay(); }
 }
 function afterPlay(){
-  muteUntil = performance.now() + 350;
+  // 200ms speaker-tail guard (was 350) — and clear the pre-roll ring so nothing recorded
+  // before/during the agent's line can be prepended to the caller's next utterance.
+  muteUntil = performance.now() + 200;
+  preRoll = [];
   if(endingCall){ endCall(); return; }
   if(listening){ setPill('listening'); rearm(); armNoReply(); }
   else { setPill('idle'); }

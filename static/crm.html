@@ -75,6 +75,8 @@
   .rec.enq .badge{background:var(--brand-soft)}
   .rec.rsvp{border-left-color:var(--rsvp)}
   .rec.rsvp .badge{background:var(--rsvp)}
+  .rec.issue{border-left-color:var(--alert)}
+  .rec.issue .badge{background:var(--alert)}
   .rec .top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
   .rec .nm{font-family:'Fraunces',serif;font-weight:600;font-size:17px;color:var(--ink)}
   .rec .ph{font-size:13px;color:var(--muted)}
@@ -129,6 +131,7 @@ const $ = id => document.getElementById(id);
 const KIND = {
   enquiry: {label:'Enquiry', cls:'enq'},
   rsvp:    {label:'RSVP',    cls:'rsvp'},
+  issue:   {label:'Issue',   cls:'issue'},
 };
 // Two separate CRMs — one per call line. The tab picks whose CRM you're looking at.
 const params = new URLSearchParams(location.search);

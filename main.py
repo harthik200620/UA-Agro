@@ -17,13 +17,17 @@ import base64
 import json
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+# override=True: this machine has stale machine-level env vars from other projects that can
+# silently SHADOW .env (dotenv's default is never-override). On Vercel there's no .env file
+# (.vercelignore), so this is a no-op there and platform env vars rule as before.
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, File, UploadFile
 from fastapi.responses import FileResponse
@@ -104,6 +108,19 @@ _RETRY_LINE = {
     "telugu": "క్షమించండి అండి, లైన్ కట్ అయ్యింది — మరోసారి చెప్పండి?",
 }
 
+# False until this serverless instance serves its first /api/turn — surfaces cold-start cost
+# in the per-turn timing telemetry.
+_WARMED = False
+
+
+def _pcm16_to_wav(pcm: bytes, sr: int = 16000) -> bytes:
+    """Wrap raw mono 16-bit PCM (the streamed-mic frames) in a minimal WAV header."""
+    import struct
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+           + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16)
+           + b"data" + struct.pack("<I", len(pcm)))
+    return hdr + pcm
+
 
 @app.post("/api/fillers")
 async def api_fillers(password: str = Form(default=""), scenario: str = Form(default=""),
@@ -183,6 +200,11 @@ _RSVP_OUTCOME_PRETTY = {
     "no_commitment": "No commitment",
 }
 
+_ISSUE_TYPE_PRETTY = {
+    "pest": "Pest issue", "disease": "Crop disease", "product_not_working": "Product issue",
+    "delivery": "Delivery issue", "service_complaint": "Service complaint", "other": "Other issue",
+}
+
 
 def _crm_row(scenario: str, tool: str, args: dict) -> dict:
     a = {k: str(v).strip() for k, v in (args or {}).items() if v is not None}
@@ -193,6 +215,13 @@ def _crm_row(scenario: str, tool: str, args: dict) -> dict:
                 ("near " + a["village"]) if a.get("village") else None,
                 a.get("notes")]
         return {"scenario": scenario, "kind": "enquiry", "name": a.get("name", ""),
+                "phone": a.get("phone", ""), "summary": " · ".join(b for b in bits if b),
+                "details": details, "status": status}
+    if tool == "log_farmer_issue":
+        kind_label = _ISSUE_TYPE_PRETTY.get(a.get("issue_type", ""), "Issue")
+        status = "Resolved on call" if a.get("outcome") == "resolved_on_call" else "Needs follow-up"
+        bits = [kind_label, a.get("crop"), a.get("description"), a.get("notes")]
+        return {"scenario": scenario, "kind": "issue", "name": a.get("name", ""),
                 "phone": a.get("phone", ""), "summary": " · ".join(b for b in bits if b),
                 "details": details, "status": status}
     if tool == "log_rsvp":
@@ -207,9 +236,9 @@ def _crm_row(scenario: str, tool: str, args: dict) -> dict:
 
 
 def _handlers_for(scenario: str, captured: dict, on_row=None) -> dict:
-    """Tool handlers. log_fap_enquiry/log_rsvp write a CRM row (and push it, for the WS path);
-    find_nearest_fap is a read-only lookup — its result feeds the model's next reply and never
-    touches the CRM."""
+    """Tool handlers. log_fap_enquiry/log_rsvp/log_farmer_issue write a CRM row (and push it,
+    for the WS path); find_nearest_fap is a read-only lookup — its result feeds the model's
+    next reply and never touches the CRM."""
     async def _save(tool: str, args: dict) -> dict:
         row = db.insert_crm(_crm_row(scenario, tool, args))
         captured["crm"] = row
@@ -222,6 +251,7 @@ def _handlers_for(scenario: str, captured: dict, on_row=None) -> dict:
 
     return {
         "log_fap_enquiry": lambda args: _save("log_fap_enquiry", args),
+        "log_farmer_issue": lambda args: _save("log_farmer_issue", args),
         "log_rsvp": lambda args: _save("log_rsvp", args),
         "find_nearest_fap": lambda args: _lookup_fap(args),
     }
@@ -245,14 +275,22 @@ async def api_turn(
     except Exception:
         contents = []
 
+    global _WARMED
+    cold = not _WARMED
+    _WARMED = True
+    t_start = time.perf_counter()
+    stt_ms = llm_ms = tts_ms = 0
+
     user_text = (text or "").strip()
     transcript = user_text
     if audio is not None:
         wav = await audio.read()
+        t0 = time.perf_counter()
         try:
             transcript = await stt.transcribe_wav(wav, _LANG_CODE.get(lng, "en-IN"))
         except Exception as e:
             return {"error": f"stt: {e}", "history": contents}
+        stt_ms = round((time.perf_counter() - t0) * 1000)
         user_text = transcript
     if not user_text:
         return {"error": "no input", "history": contents}
@@ -270,6 +308,7 @@ async def api_turn(
                 "audio_b64": audio_b64, "audio_mime": mime, "rest_text": None}
 
     captured = {"crm": None}
+    t0 = time.perf_counter()
     try:
         reply = await llm.gemini_turn(contents, user_text,
                                       _handlers_for(scenario, captured),
@@ -281,6 +320,7 @@ async def api_turn(
         reply = _RETRY_LINE.get(lng, _RETRY_LINE["english"])
         # gemini_turn already appended the user's turn; add only the graceful model line.
         contents.append({"role": "model", "parts": [{"text": reply}]})
+    llm_ms = round((time.perf_counter() - t0) * 1000)
 
     # Chat scenario: text is the product — instant replies, no TTS spend.
     if sc["chat"]:
@@ -293,6 +333,7 @@ async def api_turn(
     chunks = _split_for_tts(reply)
     audio_b64, mime, rest_text = None, None, None
     if chunks:
+        t0 = time.perf_counter()
         try:
             a, m = await tts.synthesize(chunks[0], lng)
             if a:
@@ -301,6 +342,17 @@ async def api_turn(
                     rest_text = chunks[1]
         except Exception:
             pass
+        tts_ms = round((time.perf_counter() - t0) * 1000)
+
+    timing = {
+        "stt_ms": stt_ms, "llm_ms": llm_ms, "tts_ms": tts_ms,
+        "total_ms": round((time.perf_counter() - t_start) * 1000),
+        "llm_attempts": llm.last_attempt_count, "served_by": llm.last_served_by,
+        "cold": cold,
+    }
+    # One compact line per turn into the runtime logs — real production stage costs, always on.
+    print(f"[timing] {timing['total_ms']}ms total | stt {stt_ms} | llm {llm_ms} "
+          f"(x{timing['llm_attempts']} {timing['served_by']}) | tts {tts_ms} | cold={cold}")
 
     return {
         "transcript": transcript,
@@ -310,6 +362,7 @@ async def api_turn(
         "audio_b64": audio_b64,
         "audio_mime": mime,
         "rest_text": rest_text,
+        "timing": timing,
     }
 
 
@@ -368,6 +421,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
     await _send(ws, {"type": "status", "state": "thinking"})
 
     captured = {"crm": None}
+    t_turn = time.perf_counter()
 
     async def on_row(row: dict):
         await _send(ws, {"type": "crm_created", "crm": row})
@@ -383,6 +437,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         print(f"[llm-fail] {type(e).__name__}: {e}")
         assistant_text = _RETRY_LINE.get(lng, _RETRY_LINE["english"])
         state["contents"].append({"role": "model", "parts": [{"text": assistant_text}]})
+    llm_ms = round((time.perf_counter() - t_turn) * 1000)
 
     await _send(ws, {"type": "assistant_text", "role": "assistant", "text": assistant_text})
     db.log_turn(sid, "assistant", assistant_text)
@@ -395,6 +450,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
     # Sentence-by-sentence, SEQUENTIAL on purpose: chunk 2 synthesizes while chunk 1 is already
     # playing in the browser, and staying at 1 concurrent request keeps the ElevenLabs free
     # tier (2-concurrent limit) from 429ing when fillers or /api/say overlap.
+    t0 = time.perf_counter()
     for chunk in _split_for_tts(assistant_text):
         try:
             audio, mime = await tts.synthesize(chunk, lng)
@@ -403,18 +459,24 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         if audio:
             await _send(ws, {"type": "tts_audio_meta", "mime": mime, "bytes": len(audio)})
             await ws.send_bytes(audio)
+    tts_ms = round((time.perf_counter() - t0) * 1000)
+    # Same per-turn stage telemetry as /api/turn — production calls run over WS too.
+    print(f"[timing/ws] {round((time.perf_counter() - t_turn) * 1000)}ms total | llm {llm_ms} "
+          f"(x{llm.last_attempt_count} {llm.last_served_by}) | tts {tts_ms}")
     await _send(ws, {"type": "status", "state": "idle"})
 
 
 async def _process_audio(ws: WebSocket, state: dict, wav: bytes):
     await _send(ws, {"type": "status", "state": "transcribing"})
     lng = norm_lang(state.get("lang", ""), state.get("scenario", "sales"))
+    t0 = time.perf_counter()
     try:
         text = await stt.transcribe_wav(wav, _LANG_CODE.get(lng, "en-IN"))
     except Exception as e:
         await _send(ws, {"type": "error", "where": "stt", "message": str(e), "recoverable": True})
         await _send(ws, {"type": "status", "state": "idle"})
         return
+    print(f"[timing/ws] stt {round((time.perf_counter() - t0) * 1000)}ms | {len(wav)}B wav")
     if not text:
         await _send(ws, {"type": "status", "state": "idle", "detail": "no speech detected"})
         return
@@ -433,7 +495,13 @@ async def ws_endpoint(ws: WebSocket):
                 break
 
             if msg.get("bytes") is not None:
-                await _process_audio(ws, state, msg["bytes"])
+                # Streamed-mic mode: between mic_start/mic_end the binary frames are raw 16k
+                # PCM16 chunks shipped WHILE the caller speaks — buffer them. Otherwise it's
+                # the legacy single complete-WAV upload.
+                if state.get("mic_frames") is not None:
+                    state["mic_frames"].append(msg["bytes"])
+                else:
+                    await _process_audio(ws, state, msg["bytes"])
                 continue
 
             raw = msg.get("text")
@@ -442,7 +510,16 @@ async def ws_endpoint(ws: WebSocket):
             data = json.loads(raw)
             mtype = data.get("type")
 
-            if mtype == "hello":
+            if mtype == "mic_start":
+                state["mic_frames"] = []
+            elif mtype == "mic_end":
+                frames = state.get("mic_frames") or []
+                state["mic_frames"] = None
+                if frames:
+                    await _process_audio(ws, state, _pcm16_to_wav(b"".join(frames)))
+            elif mtype == "mic_abort":
+                state["mic_frames"] = None
+            elif mtype == "hello":
                 if data.get("scenario"):
                     state["scenario"] = data["scenario"]
                 if data.get("lang"):

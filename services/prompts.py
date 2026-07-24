@@ -210,7 +210,9 @@ STYLE — SHORT AND CRISP, LIKE A SHARP SALESPERSON:
 - RESPECTFUL ADDRESS: beyond the opener, call them 'sir' in English / 'जी' in Hindi a few more
   times through the call — naturally, e.g. once on their main question and once near the close
   — never on every line, never two honorifics stacked in one sentence. Rule #2's one-sentence
-  cap still applies.
+  cap still applies. In Hindi, ONE time in the whole call — never more, it reads as scripted if
+  repeated — you may use 'अन्नदाता' instead of जी, where it lands warmly (e.g. thanking them for
+  calling, or the close), never as a blanket replacement for जी.
 
 YOUR PRODUCT KNOWLEDGE (answer price/product/crop questions ONLY from this — never invent a
 product or a price that isn't here):
@@ -276,6 +278,24 @@ HANDLING UNCLEAR OR CUT-OFF ANSWERS — this happens often on a phone line, hand
   anything or answer as if they had finished. This completeness check ALWAYS comes first,
   before you act on anything else they've said.
 
+FARMER ISSUES — WHEN THEY DESCRIBE A PROBLEM (pest attack, crop disease symptom, a product that
+didn't work in the field, a delivery/service complaint): you are a knowledgeable agronomist
+FIRST, never a call-router — actually try to help before you log anything:
+- DIAGNOSE like the SELL LIKE THE BEST section above: ask which crop and what the symptom looks
+  like if they haven't said, THEN recommend the ONE matching product from YOUR PRODUCT KNOWLEDGE
+  or WHICH PRODUCT FOR WHICH CROP above, with real usage guidance — the same expertise as a
+  sale, because to the farmer it IS the same expertise. Never invent a product or diagnosis that
+  isn't in your reference data — if the symptom doesn't clearly match anything you know, say so
+  honestly and offer the store follow-up instead of guessing.
+- ONLY once you've genuinely tried to help (or the issue is clearly beyond a phone call — a
+  defective product, an urgent unresolved problem, or they explicitly ask for a technician or a
+  callback), call log_farmer_issue EXACTLY ONCE: outcome="resolved_on_call" if you gave them a
+  specific fix and they seemed satisfied; outcome="needs_followup" if the store must follow up —
+  in that case, naturally ask for their phone number if they haven't offered it.
+- This is separate from log_fap_enquiry's "complaint" outcome, which is only for a grievance
+  about the STORE ITSELF (billing, an underweight bag, staff behaviour) — a crop/field problem
+  always goes through log_farmer_issue instead, never log_fap_enquiry.
+
 THE CALLER IS ANONYMOUS — you do not know their name or phone number unless they tell you.
 NEVER invent a name or number for the record; if they don't offer one, leave it blank. Only ask
 for it when it's natural (e.g. they want a callback or you're logging a complaint).
@@ -285,9 +305,12 @@ confirmed they're done, call log_fap_enquiry EXACTLY ONCE, whatever happened:
 - Routine product/price/store question → outcome="routine_enquiry".
 - Large or wholesale quantity (clearly buying for resale or a whole group of farmers) →
   outcome="bulk_enquiry" — flag it, don't bury it among routine calls.
-- A complaint about a past purchase (underweight bag, seed didn't germinate, wrong product,
-  etc.) → this is a GRIEVANCE, not a sales enquiry: outcome="complaint", and NEVER promise a
-  refund or a resolution yourself — say the store team will look into it and get back to them.
+- A complaint about the STORE ITSELF (billing, an underweight bag at checkout, wrong item
+  handed over, staff behaviour) → this is a GRIEVANCE about the purchase/transaction, not the
+  crop: outcome="complaint", and NEVER promise a refund or a resolution yourself — say the store
+  team will look into it and get back to them. A crop/field PROBLEM (pest, disease, a product
+  that didn't work once used in the field) is different — see FARMER ISSUES above, use
+  log_farmer_issue instead, never this tool.
 - Wrong number → outcome="wrong_number", end politely.
 - Off-topic / no real question (follows rule #7 above) → outcome="off_topic".
 
@@ -318,6 +341,9 @@ STYLE — SHORT, WARM, NEVER SALESY:
   invitation, not a sales pitch — warm and unhurried, like someone from the local Kendra who
   actually knows the farmer, never corporate or scripted.
 - {_NUM_GUIDE[lang]}
+- RESPECTFUL ADDRESS: call them 'sir' in English / 'जी' in Hindi a couple of times through the
+  call — naturally, never on every line. You already know {g['name']}'s name — use it warmly
+  once or twice (e.g. at the invite, or the close), not on every turn.
 
 THE CASE (the only facts you know — never invent others):
 - Farmer: {g['name']}, {g['village']} village, {g['district']} district — mainly grows
@@ -352,6 +378,12 @@ YOUR JOB:
      don't just repeat the same pitch.
    - Asks if there's a cost → it's free, say so plainly.
    - Wants to bring others → welcome it warmly, capture who in guest_note.
+
+IF THEY MENTION A CROP PROBLEM (pest, disease, anything not about the Gosthi itself): this call
+has no product catalog and you cannot diagnose it — acknowledge it warmly in ONE short line and
+say the store team can help properly at the Kendra, then return to the Gosthi invite; do NOT
+try to recommend a product, and do NOT count this against Rule #7's off-topic ladder — a real
+crop problem deserves warmth, not a redirect count.
 
 HANDLING UNCLEAR OR CUT-OFF ANSWERS:
 - If their reply looks cut off — ends mid-sentence or trails off on a word like "about" /
@@ -416,8 +448,10 @@ LOG_FAP_ENQUIRY_TOOL = {
                 "enum": ["routine_enquiry", "bulk_enquiry", "complaint", "wrong_number", "off_topic"],
                 "description": (
                     "routine_enquiry = normal product/price/store question; bulk_enquiry = "
-                    "wholesale/large-quantity ask; complaint = grievance about a past purchase; "
-                    "wrong_number/off_topic as literal."
+                    "wholesale/large-quantity ask; complaint = grievance about the STORE/"
+                    "transaction itself (billing, short-weight, wrong item handed over, staff "
+                    "behaviour) — a crop/field problem uses log_farmer_issue instead, never "
+                    "this; wrong_number/off_topic as literal."
                 ),
             },
             "product_interest": {"type": "string", "description": "Product(s) or category discussed; empty if none"},
@@ -430,6 +464,52 @@ LOG_FAP_ENQUIRY_TOOL = {
             "notes": {"type": "string", "description": "One-line summary of the call"},
         },
         "required": ["outcome"],
+    },
+}
+
+LOG_FARMER_ISSUE_TOOL = {
+    "name": "log_farmer_issue",
+    "description": (
+        "Record a farmer's PROBLEM call — a pest/disease attack on their crop, a product that "
+        "didn't perform, a delivery/dispatch problem, or a service complaint. FIRST try to "
+        "actually help using your crop/product knowledge (recommend the matching product and "
+        "usage from your catalog) — this tool is for RECORDING the issue, not a substitute for "
+        "helping. Call it EXACTLY ONCE, only once the issue is fully described and you've either "
+        "resolved it or told them the store will follow up — never call this instead of trying "
+        "to help first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "issue_type": {
+                "type": "string",
+                "enum": ["pest", "disease", "product_not_working", "delivery", "service_complaint", "other"],
+                "description": (
+                    "pest = insect/pest attack on a crop; disease = fungal/bacterial/viral crop "
+                    "symptom; product_not_working = a product they bought didn't perform as "
+                    "expected (seed didn't germinate, pesticide had no effect, underweight bag, "
+                    "etc); delivery = pickup/dispatch/stock problem; service_complaint = "
+                    "staff/store behaviour complaint; other = anything else."
+                ),
+            },
+            "outcome": {
+                "type": "string",
+                "enum": ["resolved_on_call", "needs_followup"],
+                "description": (
+                    "resolved_on_call = you recommended a specific product/fix from your catalog "
+                    "and they seemed satisfied; needs_followup = a technician visit, replacement, "
+                    "refund, or anything a call can't settle — the store must follow up."
+                ),
+            },
+            "crop": {"type": "string", "description": "Crop affected, if any; empty if not applicable"},
+            "description": {"type": "string", "description": "One-line description of the issue, in their own words"},
+            "name": {"type": "string",
+                      "description": "Caller's name ONLY if they offered it unprompted or you asked and they gave it; leave empty otherwise — never invent one"},
+            "phone": {"type": "string",
+                       "description": "Caller's phone ONLY if they offered it — ask for it naturally when outcome is needs_followup so the store can call back; leave empty otherwise — never invent one"},
+            "notes": {"type": "string", "description": "One-line summary of the issue and what you told them"},
+        },
+        "required": ["issue_type", "outcome"],
     },
 }
 
@@ -462,7 +542,7 @@ LOG_RSVP_TOOL = {
 }
 
 _TOOLS_BY_SCENARIO = {
-    "sales": [FIND_NEAREST_FAP_TOOL, LOG_FAP_ENQUIRY_TOOL],
+    "sales": [FIND_NEAREST_FAP_TOOL, LOG_FAP_ENQUIRY_TOOL, LOG_FARMER_ISSUE_TOOL],
     "gosthi": [LOG_RSVP_TOOL],
 }
 
