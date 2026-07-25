@@ -32,6 +32,17 @@ def _clean(name: str, default: str = "") -> str:
 
 
 def _load_keys() -> list[str]:
+    # GEMINI_ONLY_KEY: use EXACTLY this key and ignore the whole rotation pool, without deleting
+    # it. Set when a PAID key arrives — the 104-key free pool exists only to work around free-tier
+    # 429s, and mixing a paid key into it would send most turns to the exhausted free keys anyway.
+    # Clearing this one value restores the pool, so the rollback needs no code change.
+    #
+    # TRADE-OFF, deliberately accepted: with one key there is no key-level failover left. A 429 or
+    # 503 on it fails the turn to the "one moment" line instead of rotating. That is the right
+    # shape for a paid key (it should not 429), but it is a real change in failure behaviour.
+    only = _clean("GEMINI_ONLY_KEY")
+    if only:
+        return [only]
     """Gather Gemini API keys for rotation: a comma-separated GEMINI_API_KEYS, plus the
     numbered GEMINI_API_KEY / GEMINI_API_KEY_2 … GEMINI_API_KEY_150 vars (add more keys by
     just adding env vars — no code change, as long as you stay under _150). Deduped, empties
