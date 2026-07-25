@@ -63,14 +63,18 @@ SCENARIOS = {
 LANG_NAME = {"english": "English", "hindi": "Hindi"}
 
 # The agent's FIRST line — delivered the instant the call connects, before any tool logic runs.
+# Warmer, less corporate greetings. "This is Meera AT Kisan Sewa Kendra" read like a switchboard;
+# "ji" instead of "sir" and "tell me, what do you need" is how a shop actually answers the phone
+# here. The greeting itself is unchanged in substance — Namaste was always first — this is purely
+# the wording the caller asked for.
 OPENERS = {
     "sales": {
-        "english": "Namaste sir! This is Meera at Kisan Sewa Kendra — how can I help you today?",
-        "hindi": "नमस्ते जी! मैं मीरा बोल रही हूँ, किसान सेवा केंद्र से — बताइए, क्या मदद कर सकती हूँ?",
+        "english": "Namaste ji! Meera here from Kisan Sewa Kendra — tell me, what do you need today?",
+        "hindi": "नमस्ते जी! मीरा बोल रही हूँ, किसान सेवा केंद्र से — बताइए, क्या चाहिए आपको?",
     },
     "gosthi": {
-        "english": "Namaste sir! This is Kavita calling from Kisan Sewa Kendra — am I speaking with Mahesh ji? How have you been?",
-        "hindi": "नमस्ते जी! मैं कविता बोल रही हूँ, किसान सेवा केंद्र से — क्या मेरी बात महेश जी से हो रही है? कैसे हैं आप?",
+        "english": "Namaste ji! Kavita here from Kisan Sewa Kendra — am I speaking with Mahesh ji? How have you been?",
+        "hindi": "नमस्ते जी! कविता बोल रही हूँ, किसान सेवा केंद्र से — महेश जी से बात हो रही है क्या? कैसे हैं आप?",
     },
 }
 

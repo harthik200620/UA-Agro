@@ -105,11 +105,15 @@ async def api_crm(password: str = Form(default="")):
 # Chosen language → Sarvam STT language_code.
 _LANG_CODE = {"english": "en-IN", "hindi": "hi-IN", "telugu": "te-IN"}
 
-# Spoken when the LLM fails mid-call — a graceful "say that again?" instead of a raw error.
+# Spoken when the LLM fails mid-call. It used to blame the line and ask the caller to repeat
+# themselves — but their audio was fine and was transcribed correctly; it is the MODEL that
+# failed, so "say that again" makes them redo work for nothing and reads as "it can't hear me"
+# (which is exactly how it was reported). Ask for a moment instead: honest, and it invites them
+# to wait rather than to repeat.
 _RETRY_LINE = {
-    "english": "Sorry, the line broke for a second — could you say that again?",
-    "hindi": "माफ़ कीजिए जी, आवाज़ कट गई थी — एक बार फिर बता दीजिए?",
-    "telugu": "క్షమించండి అండి, లైన్ కట్ అయ్యింది — మరోసారి చెప్పండి?",
+    "english": "Sorry ji, just one moment — I'm still with you.",
+    "hindi": "एक सेकंड जी — मैं लाइन पर ही हूँ।",
+    "telugu": "ఒక్క క్షణం అండి — నేను లైన్‌లోనే ఉన్నాను.",
 }
 
 # False until this serverless instance serves its first /api/turn — surfaces cold-start cost
@@ -447,11 +451,50 @@ def _split_for_tts(text: str) -> list[str]:
     return [first, rest] if rest else [t]
 
 
+# Hesitation sounds only — NOT answers. The exclusions matter more than the inclusions here:
+# yes/no/ok/हाँ/नहीं/ठीक are real replies to a real question, and one of the reported failures was
+# already "Yes please yes" going missing, so swallowing a genuine answer would be a far worse bug
+# than occasionally answering a filler. Nothing that could ever be an answer belongs in this set.
+_FILLERS = {
+    # non-lexical hesitation sounds
+    "um", "umm", "ummm", "uh", "uhh", "uhm", "er", "err", "erm", "hm", "hmm", "hmmm",
+    "mm", "mmm", "mhm", "ah", "aah", "ahh", "eh", "oh", "ooh",
+    "हम", "हम्म", "हूँ", "हूं", "अं", "उम", "एह", "आं", "अ",
+    # discourse markers that carry no answer on their own, in either script
+    "so", "well", "like", "actually", "i", "mean",
+    "मतलब", "यानी", "वो", "वोह", "तो", "matlab", "yaani", "yani", "woh", "wo",
+}
+# NOT fillers, deliberately, and each one for a reason a test would not have told me:
+#   "क्या" / "what" alone is the caller asking me to REPEAT — the worst possible thing to ignore.
+#   "hello?" alone is them checking the line is alive, which already works correctly today.
+#   yes/no/ok/हाँ/नहीं/ठीक are answers to a question I just asked.
+# A hesitation is short. Requiring EVERY token to be a filler AND the whole utterance to be tiny
+# means a real sentence containing "matlab" or "so" can never be mistaken for one.
+_FILLER_MAX_TOKENS = 3
+
+
+def _is_filler(text: str) -> bool:
+    toks = re.findall(r"[\wऀ-ॿ]+", (text or "").lower())
+    if not toks or len(toks) > _FILLER_MAX_TOKENS:
+        return False
+    return all(t in _FILLERS for t in toks)
+
+
 async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = False):
     """One full customer turn. `silent` hides the user echo (internal no-reply nudges)."""
     text = (text or "").strip()
     if not text:
         await _send(ws, {"type": "status", "state": "idle"})
+        return
+    # A hesitation is not a turn. The caller says "umm…" while thinking, the VAD hears the pause
+    # that follows, and Sarvam returns "umm" / "हम्म" — which used to become a full turn, so the
+    # agent talked over someone who had not finished their sentence. Answer nothing, say nothing
+    # visible, and tell the client to wait longer for the rest of the thought.
+    # `state["contents"]` empty means this is the call-opening trigger, which is answered with the
+    # greeting further down. Suppressing that because the caller happened to open with "hmm" would
+    # start the call in total silence — never skip the opener.
+    if not silent and state["contents"] and _is_filler(text):
+        await _send(ws, {"type": "status", "state": "idle", "detail": "filler"})
         return
     sid = state["session_id"]
     # End-of-speech timestamp when this turn came from the mic — the only honest zero point for

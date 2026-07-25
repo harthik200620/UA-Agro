@@ -376,6 +376,10 @@ _STREAM_FORMAT = _clean("ELEVENLABS_STREAM_FORMAT", "pcm_24000")
 _STREAM_URL = ("wss://api.elevenlabs.io/v1/text-to-speech/{voice}/stream-input"
                "?model_id={model}&output_format={fmt}&inactivity_timeout=20")
 _CHUNK_SCHEDULE = [50, 160, 250, 290]
+# If no sentence-ending punctuation has arrived by this many characters, flush anyway rather than
+# leave the caller in silence waiting for a full stop. Matches the schedule's first entry, so the
+# flush lands exactly when generation would have begun on its own.
+_FLUSH_AFTER_CHARS = 50
 
 
 def stream_sample_rate() -> int:
@@ -397,6 +401,7 @@ class ElevenStream:
         self.lang = (lang or "english").lower()
         self.ok = False
         self.spoken = ""
+        self._flushed = False
         self.got_audio = False
         self.sample_rate = stream_sample_rate()
         self.mime = "audio/pcm" if self.sample_rate else "audio/mpeg"
@@ -470,11 +475,20 @@ class ElevenStream:
         if not (self.ok and self._ws and t):
             return
         payload = {"text": t + " "}
-        if not self.spoken:
-            # Force the FIRST clause into generation immediately rather than waiting for the
-            # chunk schedule to fill — this is the difference between the caller hearing the
-            # reply start and the caller hearing silence while the buffer fills.
+        # FLUSH ONLY ON A COMPLETE THOUGHT. This used to flush unconditionally on the first clause,
+        # to start generation without waiting for the chunk schedule. But flush tells ElevenLabs
+        # "that is the end of the utterance" — so when the first clause ended on a COMMA (which,
+        # before the clause-splitter fix, was most replies) it synthesised a fragment with
+        # continuation intonation, never resolving downward, and rendered the remaining "sir." as
+        # a fresh utterance: the reported gap and high pitch. Flushing on a hard terminator keeps
+        # the whole latency win and costs nothing prosodically, because there the fragment really
+        # IS the end of a sentence.
+        hard = t.endswith(tuple(".?!।…"))
+        if not self._flushed and (hard or len(self.spoken) + len(t) >= _FLUSH_AFTER_CHARS):
+            # The length arm is the safety net: a reply that opens with a long comma-spliced
+            # preamble must not sit unspoken waiting for a full stop that is still being written.
             payload["flush"] = True
+            self._flushed = True
         try:
             await self._ws.send(json.dumps(payload))
             self.spoken = (self.spoken + " " + t).strip()
@@ -486,6 +500,12 @@ class ElevenStream:
         await self._ready()
         if self._ws and self.ok:
             try:
+                # Give the model a terminator if the reply has none. Without one ElevenLabs has no
+                # cue that the utterance is finished and leaves the last words hanging on a
+                # continuation contour — the "doesn't end the sentence with a low pitch" half of
+                # the report. A bare full stop is enough; it adds no audible word.
+                if self.spoken and not self.spoken.endswith(tuple(".?!।…")):
+                    await self._ws.send(json.dumps({"text": ". "}))
                 await self._ws.send(json.dumps({"text": ""}))
             except Exception:
                 self.ok = False

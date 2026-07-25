@@ -915,6 +915,13 @@ function onWsMessage(ev){
       if(m.state!=='idle'){ setPill(m.state); break; }
       hideTyping(); waitingForServer=false;
       dropAudioUntilIdle=false;            // the abandoned reply is over; the next one is real
+      if(m.detail==='filler'){
+        // The caller was thinking out loud ("umm…"), not finishing. Say nothing, show nothing,
+        // and give them a longer pause budget for the rest of the sentence — a visible note here
+        // would be worse than the bug, because it tells them something went wrong when nothing
+        // did. One turn only: fillerGrace is consumed the next time a turn ends.
+        fillerGrace=true; endOfStream(); break;
+      }
       if(m.detail==='no speech detected'){ onBrokenInput(); break; }
       endOfStream();
       break;
@@ -1047,6 +1054,11 @@ function setThr(v){ _thrVal=v; }
 const PREROLL_MS=300, SILENCE_END_MS=300, MIN_SPEECH_MS=180, MAX_TURN_MS=9000;
 const MIN_COMPLETE_MS=250, FRAGMENT_WAIT_MS=600;
 const LONG_TURN_MS=2500, THINKING_WAIT_MS=480;
+// Applied for ONE turn after the server reports the caller only said a filler ("umm…", "हम्म").
+// Deliberately generous: someone who has just audibly hesitated is mid-sentence, and cutting in
+// on them twice in a row is the exact complaint this fixes.
+const FILLER_WAIT_MS=900;
+let fillerGrace=false;
 // Noise-floor window and its clamps. NF_MIN is roughly a decent mic's residual self-noise after
 // noiseSuppression — below it, thresholds derived from the floor become absurd. NF_MAX stops a
 // genuinely loud shop from pushing the onset threshold beyond any speaker's reach: occasional
@@ -1367,6 +1379,9 @@ function onPcm(chunk){
     let endPauseMs=SILENCE_END_MS;
     if(recentMs<MIN_COMPLETE_MS && turnMs<1200) endPauseMs=FRAGMENT_WAIT_MS;
     else if(turnMs>=LONG_TURN_MS)               endPauseMs=THINKING_WAIT_MS;
+    // The previous turn was a hesitation, so the caller is mid-thought: give them room to reach
+    // the rest of it instead of cutting in again the moment they pause a second time.
+    if(fillerGrace) endPauseMs=Math.max(endPauseMs, FILLER_WAIT_MS);
     const silenceEnd=srate*endPauseMs/1000, maxS=srate*MAX_TURN_MS/1000;
     // THREE independent ways for a turn to end, because relying on one has failed twice:
     //  1. the tolerant silence accumulator (the good path, ~300ms after the caller stops);
@@ -1394,6 +1409,7 @@ function endTurn(){
   const frames=speechFrames;
   const durMs = frames.reduce((a,c)=>a+c.length,0)/srate*1000;
   silentRun=0; recentVoiced=0; framesSinceVoiced=0; onsetRun=0; turnPeak=0;
+  fillerGrace=false;                 // consumed: this turn already got the longer pause budget
   if(durMs<MIN_SPEECH_MS){
     speechFrames=[]; speechSamples=0;
     if(streamed) wsSend({type:'mic_abort'});   // server discards the partial buffer

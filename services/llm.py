@@ -96,6 +96,23 @@ def _model_for_key_idx(idx: int) -> str:
     return GEMINI_MODEL if idx < _PRIMARY_KEY_COUNT else GEMINI_MODEL_FALLBACK
 
 
+# LAST-RESORT MODEL. GEMINI_MODEL_FALLBACK is deliberately the SAME model as GEMINI_MODEL (see
+# .env for why moving the whole tier to a second model failed), which means the stack has had NO
+# model-level redundancy at all — and production logs show that costing real turns: a 503 "this
+# model is currently experiencing high demand" killed a turn outright, and no number of keys can
+# route around a model-wide outage.
+#
+# So: a different model, tried ONLY after _LAST_RESORT_AFTER keys have already failed this turn.
+# That ordering is the whole design. It can never become the workhorse (which is exactly the
+# mistake recorded in .env), it costs a healthy turn nothing, and it only ever runs on turns that
+# were otherwise about to be lost — where a different model with its own separate quota is the
+# only thing that can still answer. gemini-3-flash-preview measured 1556ms TTFT on 6/6 keys.
+_LAST_RESORT_MODEL = _clean("GEMINI_LAST_RESORT_MODEL", "gemini-3-flash-preview")
+if not re.fullmatch(r"gemini-[A-Za-z0-9.\-]*", _LAST_RESORT_MODEL or ""):
+    _LAST_RESORT_MODEL = ""
+_LAST_RESORT_AFTER = max(2, _int_env("GEMINI_LAST_RESORT_AFTER", 6))
+
+
 # PRIORITY KEY TIERS: newly-issued keys are far less contended than the original pool, so
 # they should absorb traffic first. GEMINI_FRESH_KEY_COUNT keys are the FRESH tier — the LAST
 # that many keys loaded (freshest batches are always appended, never inserted, see
@@ -316,7 +333,13 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
     all_cooling = all(_cooldown.get(i, 0) > now for i in range(len(_KEYS)))
 
     def _body_for(key_idx: int) -> tuple[str, dict]:
+        # Once this turn has already burned _LAST_RESORT_AFTER keys, the pool is not going to
+        # answer — the remaining keys share the same exhausted project-wide quota, or the model
+        # itself is down (a 503 "high demand" killed a real turn in production). Switch models
+        # rather than keep paying for the same refusal on key after key.
         model = _model_for_key_idx(key_idx)
+        if _LAST_RESORT_MODEL and last_attempt_count >= _LAST_RESORT_AFTER:
+            model = _LAST_RESORT_MODEL
         gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
         thinking = _thinking_config_for(model)
         if thinking:
@@ -485,7 +508,12 @@ _MAX_INFLIGHT_ERR = max(1, _int_env("GEMINI_MAX_INFLIGHT_ERR", 1))
 # stalls waits out the httpx read timeout once per rotation — measured 24s of pure silence on a
 # quota-stressed pool, which is a dead call. At the ceiling we stop and let gemini_turn speak its
 # graceful "say that again?" line instead: bad, but an order of magnitude less bad than silence.
-_TTFT_GIVEUP_MS = max(2000, _int_env("GEMINI_TTFT_GIVEUP_MS", 7000))
+# 7000 -> 4500. Production logs show every quota cascade running the deadline out in full, so this
+# is not a theoretical ceiling — it is exactly how long the caller sits in silence before hearing
+# "sorry, could you say that again". A healthy turn reaches first token in ~1.5s and a hedge adds
+# ~2.5s, so 4.5s still covers the slowest legitimate path; past that the turn is not coming back
+# and the only question is how long the caller is made to wait to be told so.
+_TTFT_GIVEUP_MS = max(2000, _int_env("GEMINI_TTFT_GIVEUP_MS", 4500))
 _DEBUG = _clean("GEMINI_DEBUG", "0").lower() not in ("0", "false", "no", "off", "")
 # TRIED AND REMOVED (2026-07-25): a "last resort" pass that re-asked an emergency model
 # (gemini-flash-lite-latest) on untouched keys once every key had failed on the real one. The
@@ -495,7 +523,12 @@ _DEBUG = _clean("GEMINI_DEBUG", "0").lower() not in ("0", "false", "no", "off", 
 # 40s. Failing fast and saying "sorry, the line broke" beats an unbounded rescue attempt.
 
 _CLAUSE_HARD, _CLAUSE_SOFT = "।?!.…\n", ",;:—"
-_CLAUSE_MIN, _CLAUSE_SOFT_MIN, _CLAUSE_MAX = 12, 40, 90
+# _CLAUSE_SOFT_MIN 40 -> 75. At 40 a comma anywhere past the 40th character split the sentence,
+# which on a one-sentence reply (Rule #2 caps them at one sentence) meant almost every reply was
+# cut at its last comma — precisely where the trailing honorific lives. At 75 a soft split only
+# happens in a genuinely long sentence, so the common case now streams whole and ElevenLabs gives
+# it a single, properly-falling intonation contour instead of two half-phrases.
+_CLAUSE_MIN, _CLAUSE_SOFT_MIN, _CLAUSE_MAX = 12, 75, 110
 
 
 # RECORD TALK — the CRM row leaking into the caller's ear.
@@ -569,6 +602,29 @@ def _speakable(s: str) -> str:
     return _strip_record_talk(re.sub(r"\s+", " ", s).strip())
 
 
+# A trailing honorific must NEVER become its own clause. Reported from a real call as "it takes a
+# gap and says sir in a high pitch", and reproduced exactly: "…per bag, sir." split into
+# ["…per bag,"] + ["sir."]. The first fragment is what gets flush:true in ElevenStream.feed, so
+# ElevenLabs synthesises a COMMA-TERMINATED FRAGMENT as a finished utterance — which is why the
+# sentence never falls at the end — and then renders "sir." as a separate utterance, which is the
+# gap and the high pitch. prompts.py actively asks for 'sir'/'जी' mid-call, so this fired
+# constantly rather than occasionally.
+_VOCATIVE = re.compile(r"^[\s,]*(?:sir|madam|ji|जी|जनाब|अन्नदाता)\b[\s,;:—.!?]*$", re.IGNORECASE)
+# A soft split also must not leave a stub behind it. 14 chars is comfortably longer than any
+# honorific plus its punctuation, and short enough that genuine second clauses still stream early.
+_CLAUSE_TAIL_MIN = 14
+
+
+def _tail_ok(buf: str, i: int) -> bool:
+    """May we split after index `i`? Only if what follows is a real clause, not an orphan.
+
+    Two ways to be an orphan: too short to stand on its own, or a bare honorific. Both produce the
+    same audible defect. Note this can only DELAY a split — the tail is flushed intact at
+    end-of-stream — so the worst case is a fractionally later first chunk, never lost words."""
+    tail = buf[i + 1:]
+    return len(tail.strip()) >= _CLAUSE_TAIL_MIN and not _VOCATIVE.match(tail)
+
+
 def _next_clause(buf: str) -> tuple[str, str]:
     """Peel one speakable clause off a growing buffer -> (clause, remainder)."""
     if len(buf) < _CLAUSE_MIN:
@@ -586,11 +642,11 @@ def _next_clause(buf: str) -> tuple[str, str]:
             if ch == "." and (buf[i - 1:i].isdigit() or buf[i + 1:i + 2].isdigit()):
                 continue
             return buf[:i + 1], buf[i + 1:]
-        if ch in _CLAUSE_SOFT and i + 1 >= _CLAUSE_SOFT_MIN:
+        if ch in _CLAUSE_SOFT and i + 1 >= _CLAUSE_SOFT_MIN and _tail_ok(buf, i):
             return buf[:i + 1], buf[i + 1:]
     if len(buf) >= _CLAUSE_MAX:                    # no punctuation in sight — break on a word
         cut = buf.rfind(" ", _CLAUSE_MIN, _CLAUSE_MAX)
-        if cut > 0:
+        if cut > 0 and _tail_ok(buf, cut):
             return buf[:cut + 1], buf[cut + 1:]
     return "", buf
 
@@ -660,7 +716,13 @@ async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "
     all_cooling = all(_cooldown.get(i, 0) > time.time() for i in range(len(_KEYS)))
 
     def _body_for(key_idx: int) -> tuple[str, dict]:
+        # Once this turn has already burned _LAST_RESORT_AFTER keys, the pool is not going to
+        # answer — the remaining keys share the same exhausted project-wide quota, or the model
+        # itself is down (a 503 "high demand" killed a real turn in production). Switch models
+        # rather than keep paying for the same refusal on key after key.
         model = _model_for_key_idx(key_idx)
+        if _LAST_RESORT_MODEL and last_attempt_count >= _LAST_RESORT_AFTER:
+            model = _LAST_RESORT_MODEL
         gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
         thinking = _thinking_config_for(model)
         if thinking:

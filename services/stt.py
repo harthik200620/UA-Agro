@@ -252,6 +252,13 @@ class SarvamStream:
         # this call was taking). Poll finely rather than sleeping in big steps.
         loop = asyncio.get_event_loop()
         hard_deadline = loop.time() + timeout
+        # A DEAD socket must not be waited on. Production logs show "stt-stream 2508ms | MISS ->
+        # batch" — the full timeout spent polling a socket that had already closed with nothing,
+        # after which the batch call answered in 150-245ms. The reader task finishing IS the
+        # signal that no further segment can ever arrive, so believe it immediately.
+        if self._reader is not None and self._reader.done() and not self._parts:
+            await self._shut()
+            return ""
         # 150ms -> 100ms. Measured, on real speech, segments of one utterance land ~1ms and ~94ms
         # after flush, so the gap only has to outlast the inter-segment spacing, not the whole
         # utterance. Every ms here is dead air the caller sits through AFTER they have stopped
@@ -265,6 +272,8 @@ class SarvamStream:
                 continue
             if self._parts and (loop.time() - last_change) >= quiet_s:
                 break
+            if not self._parts and self._reader is not None and self._reader.done():
+                break            # socket closed empty mid-wait — nothing more can arrive
         await self._shut()
         if self._parts:
             sarvam_keys.mark_ok(self._key)
