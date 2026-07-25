@@ -466,6 +466,21 @@ _MAX_RACE = max(1, _int_env("GEMINI_MAX_RACE", 2))
 # briefly set to 6, tuned against a test harness firing back-to-back turns — far too tight for a
 # single live caller, who then got a 7s "sorry, the line broke" while 90+ healthy keys sat idle.
 _MAX_KEYS_PER_TURN = max(2, _int_env("GEMINI_MAX_KEYS_PER_TURN", 20))
+# How many requests may be IN FLIGHT while replacing keys that have already been REJECTED. This
+# is the cascade brake, and it is deliberately separate from _MAX_RACE: _MAX_RACE governs
+# speculation (firing an extra key at a stream that has gone quiet but may still answer), whereas
+# this governs recovery (something came back 429/404 and that key is out of the running). Walking
+# rejections one at a time cost a measured 6978ms on a single turn — 13 keys x ~500ms, strictly
+# serial — while the caller listened to nothing. 3 keeps the recovery bounded without turning a
+# cascade into a burst that makes the cascade worse.
+#
+# DEFAULT 1 — MEASURED, not assumed. At 3 the p50 went 2501ms -> 7483ms: a turn walked 15-16 keys
+# instead of 13, every one 429, and it hit the 7s give-up deadline. Recovering FASTER from a
+# rejection cascade also means spending the shared quota faster, which deepens the cascade for the
+# NEXT turn — and on this pool the 429s are project-wide, not per-key, so more keys is not more
+# quota. At 1 this is exactly the old serial behaviour, just handled inside the loop instead of
+# falling out to the outer one. Raise it only against a pool with genuinely per-key quota.
+_MAX_INFLIGHT_ERR = max(1, _int_env("GEMINI_MAX_INFLIGHT_ERR", 1))
 # Hard ceiling on "no first token from ANY key". Without it, a turn where every raced stream
 # stalls waits out the httpx read timeout once per rotation — measured 24s of pure silence on a
 # quota-stressed pool, which is a dead call. At the ceiling we stop and let gemini_turn speak its
@@ -622,7 +637,12 @@ async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "
         try:
             _launch(primary, 0)
             last_attempt_count += 1
-            first_chunk, fired = None, 1
+            # `fired` = keys launched in this block (also the index into `order` for the next one).
+            # `raced` counts only SPECULATIVE launches — the stall escalations — and is what
+            # _MAX_RACE bounds. They were the same counter until error-replacement was added
+            # below, which would otherwise have spent the speculation budget on rejections and
+            # left a genuine stall with no backup.
+            first_chunk, fired, raced = None, 1, 1
             next_deadline = time.monotonic() + _TTFT_STALL_MS / 1000
             while tasks and winner is None:
                 # ESCALATING stagger. Firing exactly one backup wasn't enough: measured stalls of
@@ -634,7 +654,7 @@ async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "
                 budget = turn_deadline - time.monotonic()
                 if budget <= 0:
                     break
-                can_escalate = (more is not None and fired < _MAX_RACE
+                can_escalate = (more is not None and raced < _MAX_RACE
                                 and last_attempt_count < _MAX_KEYS_PER_TURN)
                 wait_s = max(0.01, min(next_deadline - time.monotonic(), budget)
                              if can_escalate else budget)
@@ -651,6 +671,7 @@ async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "
                               f"{_TTFT_STALL_MS}ms — escalating to key{more + 1}", flush=True)
                     _launch(more, fired)
                     fired += 1
+                    raced += 1
                     last_attempt_count += 1
                     next_deadline = time.monotonic() + _TTFT_STALL_MS / 1000
                     continue
@@ -668,6 +689,24 @@ async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "
                 elif _DEBUG:
                     print(f"  [gem] key{k + 1} {m} stream ended with no content", flush=True)
                 tasks.pop(tag, None)
+                # REPLACE A FAILED KEY IMMEDIATELY, IN PLACE. Letting `tasks` drain to empty fell
+                # out to the outer loop, which relaunched exactly one key — so a 429 cascade ran
+                # STRICTLY SERIALLY at ~500ms per rejection. Measured: one turn spent 6978ms
+                # walking 13 keys that way, and the tail, not the median, is what a caller
+                # experiences as "it hangs sometimes". Refilling here keeps _MAX_INFLIGHT_ERR
+                # requests moving at once during a cascade only. This is NOT speculative racing:
+                # it fires solely in response to a rejection already received, so a healthy turn
+                # (one key, one request) sends exactly as much traffic as before and the burst
+                # rate that 429s this pool is untouched.
+                if (len(tasks) < _MAX_INFLIGHT_ERR
+                        and last_attempt_count < _MAX_KEYS_PER_TURN
+                        and time.monotonic() < turn_deadline):
+                    nxt = order[attempt + fired] if attempt + fired < len(order) else None
+                    if nxt is not None:
+                        _launch(nxt, fired)
+                        fired += 1
+                        last_attempt_count += 1
+                        next_deadline = time.monotonic() + _TTFT_STALL_MS / 1000
             if winner is None:
                 continue                        # nothing came back on this key — try the next
             for tag, t in tasks.items():

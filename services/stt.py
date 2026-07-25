@@ -252,7 +252,12 @@ class SarvamStream:
         # this call was taking). Poll finely rather than sleeping in big steps.
         loop = asyncio.get_event_loop()
         hard_deadline = loop.time() + timeout
-        quiet_s, seen, last_change = 0.15, len(self._parts), loop.time()
+        # 150ms -> 100ms. Measured, on real speech, segments of one utterance land ~1ms and ~94ms
+        # after flush, so the gap only has to outlast the inter-segment spacing, not the whole
+        # utterance. Every ms here is dead air the caller sits through AFTER they have stopped
+        # talking, and it is spent on the far side of a 1.65s model wait that measurement shows
+        # cannot be shortened at all — so the cheap milliseconds are the only ones left to take.
+        quiet_s, seen, last_change = 0.10, len(self._parts), loop.time()
         while loop.time() < hard_deadline:
             await asyncio.sleep(0.02)
             if len(self._parts) != seen:

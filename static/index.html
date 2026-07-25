@@ -29,7 +29,7 @@
     --shadow-md:0 20px 48px rgba(20,15,50,.12), 0 4px 14px rgba(20,15,50,.05);
     --shadow-lg:0 36px 84px rgba(15,12,45,.20), 0 10px 28px rgba(15,12,45,.08);
     --r-lg:24px; --r-md:16px; --r-sm:12px;
-    --amp:0;
+    --amp:0; --thr:1; --hot:0;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%}
@@ -94,9 +94,14 @@
   /* Live mic level. Without this a caller has no way to tell "the agent is thinking" apart from
      "the agent cannot hear me at all" — the single most confusing failure in a voice demo. */
   .meter{display:inline-block;width:70px;height:7px;border-radius:4px;vertical-align:middle;
-    margin-left:10px;background:rgba(20,15,50,.12);overflow:hidden}
+    margin-left:10px;background:rgba(20,15,50,.12);overflow:hidden;position:relative}
   .meter i{display:block;height:100%;border-radius:4px;
-    width:calc(var(--amp) * 100%);background:var(--green);transition:width .07s linear}
+    width:calc(var(--amp) * 100%);transition:width .07s linear;
+    background:color-mix(in srgb, var(--green) calc(var(--hot) * 100%), #B9BED6)}
+  /* The threshold marker: the level a voice has to cross before the agent starts capturing.
+     Bar short of the line = it genuinely cannot hear you, and you can see that instantly. */
+  .meter b{position:absolute;top:0;bottom:0;width:2px;background:rgba(20,15,50,.45);
+    left:calc(var(--thr) * 100%);transition:left .2s linear}
   .dot.busy{
     background:radial-gradient(circle at 32% 26%, #8D97E8, var(--brand) 62%, var(--brand-deep) 100%);
     animation:dotbusy 1s ease-in-out infinite}
@@ -317,7 +322,7 @@
       Mic sensitivity
       <input type="range" id="sens" min="0.006" max="0.04" step="0.002" value="0.016">
       <span id="sensval">normal</span>
-      <span class="meter" title="Live microphone level — this moves when the agent can hear you."><i></i></span>
+      <span class="meter" title="Live microphone level. The dark line is the level your voice has to cross before the agent starts listening — if the green bar never reaches it, drag Sensitivity left."><i></i><b></b></span>
       <label style="margin-left:14px;cursor:pointer;user-select:none"
              title="Headphones or phone held to your ear: lets you interrupt the agent mid-sentence. Leave OFF on speakerphone — the agent would hear its own voice and cut itself off.">
         <input type="checkbox" id="bargeToggle" style="vertical-align:middle"> 🎧 Interrupt mode
@@ -993,6 +998,10 @@ let capturing=false, speechFrames=[], preRoll=[], speechSamples=0, srate=48000;
 // VAD working state. `silentSamples`/`voicedSamples`/`noiseFloor` are RETIRED — see onPcm.
 let nfBucket=Infinity, nfPrev=Infinity, nfBucketStart=0;   // sliding-minimum noise floor
 let onsetRun=0, silentRun=0, recentVoiced=0, framesSinceVoiced=0, rvDecay=0.998;
+// Decaying maxima. sigPeak = loudest thing this MIC has produced recently (survives across turns,
+// so it is already warm when the caller first speaks); turnPeak = loudest thing in THIS turn.
+let sigPeak=0, turnPeak=0, peakDecay=0.9999, turnPeakDecay=0.9995;
+let deafSince=0, deafNoted=false;                          // never-captured-anything watchdog
 // VAD threshold cached from the slider (see its input handler) and the level meter coalesced to
 // one style write per frame paint. Both used to run per 128-sample audio frame — ~375×/sec of
 // DOM reads and layout-invalidating style writes on the thread that also runs the VAD and
@@ -1009,28 +1018,84 @@ function setAmp(v){
   _ampVal=v;
   if(_ampRaf) return;
   _ampRaf=requestAnimationFrame(()=>{ _ampRaf=0;
-    document.documentElement.style.setProperty('--amp', _ampVal.toFixed(3)); });
+    document.documentElement.style.setProperty('--amp', _ampVal.toFixed(3));
+    document.documentElement.style.setProperty('--thr', _thrVal.toFixed(3));
+    document.documentElement.style.setProperty('--hot', _ampVal>=_thrVal ? 1 : 0); });
 }
+// The meter now shows the LINE the caller has to clear, not just their level. When "it isn't
+// taking my voice" happens again, this turns an invisible failure into a visible one: either the
+// green bar never reaches the marker (mic too quiet / threshold too high) or it does and the
+// problem is downstream. Diagnosing the last three rounds would have taken seconds with this.
+let _thrVal=0;
+function setThr(v){ _thrVal=v; }
 // MIN_SPEECH 180 (was 300): real one-word answers ("हाँ", "yes") were being discarded as
 // non-speech. SILENCE_END 350 is the common-case end-of-turn hold, tuned against real Hindi.
 // MIN_COMPLETE is now measured against RECENT voice (see recentVoiced), not a cumulative total —
 // as a cumulative counter it cleared after the first syllable and FRAGMENT_WAIT was dead code.
 // THINKING_WAIT applies only past LONG_TURN_MS, because that is where recall pauses live (a
 // price, a quantity, a village name) and being cut off mid-number is far worse than +200ms.
-const PREROLL_MS=300, SILENCE_END_MS=350, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
-const MIN_COMPLETE_MS=250, FRAGMENT_WAIT_MS=700;
-const LONG_TURN_MS=2500, THINKING_WAIT_MS=550;
+const PREROLL_MS=300, SILENCE_END_MS=300, MIN_SPEECH_MS=180, MAX_TURN_MS=9000;
+const MIN_COMPLETE_MS=250, FRAGMENT_WAIT_MS=600;
+const LONG_TURN_MS=2500, THINKING_WAIT_MS=480;
 // Noise-floor window and its clamps. NF_MIN is roughly a decent mic's residual self-noise after
 // noiseSuppression — below it, thresholds derived from the floor become absurd. NF_MAX stops a
 // genuinely loud shop from pushing the onset threshold beyond any speaker's reach: occasional
 // false captures are recoverable (MIN_SPEECH_MS discards them), deafness is not.
-const NF_WINDOW_MS=1500, NF_MIN=0.0015, NF_MAX=0.02;
-// SIL_K +5.1dB clears the ±3-4dB non-stationarity of a real room. START_K +12dB is the
-// conservative "unambiguously voice" margin. HYST_FRAC guarantees >=6.9dB between them in every
-// corner, so the slider trim can never push the thresholds back down into the room.
-const SIL_K=1.8, SIL_ABS_MIN=0.0025, START_K=4.0, START_MIN=0.005, START_MAX=0.09;
+// NF_MIN was 0.0015 — chosen as "a decent mic's residual self-noise". But it is a FLOOR ON THE
+// FLOOR, and every threshold is derived from the floor, so on a genuinely quiet capture chain it
+// silently inflates the whole ladder above the caller's voice. Dropped to 0.0004 so a quiet room
+// is allowed to actually read as quiet; the signal-relative terms below now do the job of keeping
+// the thresholds sane, which is what NF_MIN was standing in for.
+// 1500ms -> 1000ms: the window is how long the floor can lag a step change in the room, and every
+// ms of that lag is a window in which ambient noise reads as speech.
+const NF_WINDOW_MS=1000, NF_MIN=0.0004, NF_MAX=0.02;
+// SIL_K was 1.8 (+5.1dB) and that number was WRONG BY CONSTRUCTION, which is why "the agent stops
+// listening" survived the last fix. +5.1dB is the right allowance over a room's MEAN level — but
+// the floor tracker returns a sliding MINIMUM, and the minimum frame of a noise bed sits well
+// below its mean. MEASURED here: room mean 0.00215 against nf 0.00085, a factor of 2.5, so
+// silT = nf*1.8 = 0.00153 landed UNDER the room and no frame ever counted as silence. The turn
+// then hung until something else rescued it. 3.5 covers the min->mean gap (2.5) plus the frame-to
+// -frame fluctuation on top of it; verified against a live noise bed rather than reasoned about.
+const SIL_K=3.5, SIL_ABS_MIN=0.0025, START_K=4.0, START_MAX=0.09;
 const HYST_FRAC=0.45, CONTINUE_FRAC=0.70;
 const ONSET_SUSTAIN_MS=60, SIL_FORGIVE=3.0, NEUTRAL_AS_SILENCE_MS=900, RV_TAU_MS=1200;
+// ── SIGNAL-RELATIVE thresholds: the part that makes the two failure modes structurally
+// impossible rather than merely unlikely.
+//
+// START_MIN used to be an ABSOLUTE 0.005 onset floor. On a laptop mic, a far-field speaker, or
+// any device where the browser hands us a low-gain stream, ordinary speech peaks at 0.003-0.008
+// — under that floor the onset test NEVER fires and the agent is 100% deaf with nothing in the
+// console to say so. That is the "not taking input at all" report, and no amount of tuning the
+// floor-relative term fixes it, because the absolute floor wins. So: the absolute floor drops to
+// a value below any real signal (ONSET_ABS_MIN), and the onset threshold is additionally CAPPED
+// at a fraction of the loudest thing this mic has actually produced (PEAK_ONSET x sigPeak) —
+// never below +6dB over the room, so quiet does not mean trigger-happy. A quiet mic now scales
+// the threshold down to meet it; a loud one leaves the cap inactive.
+//
+// Silence is the mirror. A floor-derived silence threshold is only as good as the floor estimate,
+// and the floor estimate is the single most fragile number here — it has now been wrong in two
+// different directions in two rounds. PEAK_SIL adds a SECOND, INDEPENDENT estimator that needs no
+// floor at all: silence is anything >17dB below the caller's OWN voice this turn. Taking the max
+// of the two means either one alone can end the turn, so end-of-turn survives a completely wrong
+// floor. It is also gain-invariant by construction, which is what makes it immune to the AGC ramp
+// that defeated the previous scheme.
+//
+// SIL_ABS_MIN needs the same treatment and is the subtler trap: through the hysteresis rule
+// (onsetT >= silT/HYST_FRAC) a fixed 0.0025 silence floor imposes a 0.0056 ABSOLUTE onset floor —
+// higher than the START_MIN it replaced. Removing START_MIN alone would have changed nothing on
+// the exact devices that are failing. PEAK_SIL_ABS lets it scale down with the signal too, so
+// there is no longer ANY fixed number anywhere in the chain that a quiet mic can fail to clear.
+const ONSET_ABS_MIN=0.0018, PEAK_ONSET=0.35, PEAK_SIL=0.14, ONSET_FLOOR_K=2.0;
+const PEAK_SIL_ABS=0.10, SIL_HARD_MIN=0.0004;
+// Per-frame attack coefficient for sigPeak (~1.3s time constant at a 2.67ms frame). Slow on
+// purpose — see the derivation of sigPeak in onPcm.
+const PEAK_ATTACK=0.002;
+const PEAK_TAU_MS=6000, TURN_PEAK_TAU_MS=2500;
+// Hard, accumulator-independent backstop: this much wall-clock with nothing above voiceT ends the
+// turn no matter what the silence accumulator believes. voiceT is ~22% of the caller's own peak,
+// so room noise cannot hold it open.
+const HARD_QUIET_MS=900;
+const VAD_DEBUG=/[?&]vad=1/.test(location.search);
 
 async function startMic(){
   try{
@@ -1085,7 +1150,11 @@ async function startMic(){
   // ACTUAL frame size now that srate is known (a frame is 128 samples).
   nfBucket=Infinity; nfPrev=Infinity; nfBucketStart=performance.now();
   onsetRun=0; silentRun=0; recentVoiced=0; framesSinceVoiced=0;
-  rvDecay=Math.exp(-(128/srate*1000)/RV_TAU_MS);
+  sigPeak=0; turnPeak=0; deafSince=0; deafNoted=false;
+  const frameMs=128/srate*1000;
+  rvDecay=Math.exp(-frameMs/RV_TAU_MS);
+  peakDecay=Math.exp(-frameMs/PEAK_TAU_MS);
+  turnPeakDecay=Math.exp(-frameMs/TURN_PEAK_TAU_MS);
 }
 function stopMic(){
   try{ if(workletNode){workletNode.port.onmessage=null; workletNode.disconnect();} }catch(e){}
@@ -1180,16 +1249,50 @@ function onPcm(chunk){
   if(rms<nfBucket) nfBucket=rms;
   const nf=Math.min(NF_MAX, Math.max(NF_MIN, Math.min(nfBucket, nfPrev)));
 
-  // ── THREE THRESHOLDS, derived floor-first ──────────────────────────────────
-  // silT is derived from the ROOM and the slider can never touch it. That is the whole fix:
-  // previously silT inherited the slider cap, stopped tracking the room, and any room noisier
-  // than 0.6*slider could never register silence.
+  // ── SIGNAL PEAKS: the second, floor-independent estimator ───────────────────
+  // Decaying maxima. sigPeak answers "how loud does this microphone actually get?" and is the
+  // only thing that can rescue a low-gain capture chain; turnPeak answers "how loud is THIS
+  // caller, right now?" and is the only end-of-turn reference that survives a wrong noise floor
+  // and an AGC ramp at the same time.
+  // sigPeak has a SLOW ATTACK, and that is the whole point rather than an implementation detail.
+  // With an instant attack (plain running max) it reacted to a level STEP — a noise bed starting,
+  // an AC cutting in, a phone being picked up — a full noise-floor window before the floor
+  // tracker could follow. For that window the quiet-mic rescue below saw "loud signal, low floor"
+  // and dropped the onset threshold under the new ambient, so the step itself started a junk
+  // turn. MEASURED before this line existed: room noise switched on at t=340ms began a capture
+  // that then ran 5.1s. A ~1.3s attack makes sigPeak converge no faster than the floor it is
+  // compared against, so the rescue can never lead the floor again.
+  sigPeak = rms>sigPeak ? sigPeak+(rms-sigPeak)*PEAK_ATTACK : sigPeak*peakDecay;
+  // turnPeak keeps its instant attack, deliberately: it only ever RAISES silT, i.e. only ever
+  // ends turns sooner, so reacting immediately to the caller's real level is purely safe.
+  if(capturing) turnPeak = Math.max(rms, turnPeak*turnPeakDecay);
+
+  // ── THREE THRESHOLDS, derived floor-first then signal-corrected ────────────
+  // silT is derived from the ROOM and the slider can never touch it; PEAK_SIL then gives it a
+  // completely independent second source, so end-of-turn no longer rests on the floor estimate
+  // being right. Taking the MAX means either estimator alone is enough to hear the pause.
   const trim=Math.max(0.5, Math.min(2.0, sensVal/0.016));   // slider = +/-1 octave of trim
-  const silT=Math.max(nf*SIL_K, SIL_ABS_MIN);
-  let onsetT=Math.max(START_MIN, Math.min(START_MAX, nf*START_K*trim));
+  // turnPeak only counts WHILE capturing: left in, a loud turn would keep silT (and through the
+  // hysteresis rule below, onsetT) raised into the next turn and make a quiet follow-up answer
+  // unhearable — trading one deafness bug for another.
+  const silAbs=Math.min(SIL_ABS_MIN, Math.max(SIL_HARD_MIN, sigPeak*PEAK_SIL_ABS));
+  const silT=Math.max(nf*SIL_K, silAbs, capturing ? turnPeak*PEAK_SIL : 0);
+  let onsetT=Math.max(ONSET_ABS_MIN, Math.min(START_MAX, nf*START_K*trim));
+  // QUIET-MIC RESCUE. Pull the onset threshold down to meet a genuinely low-level capture chain,
+  // but never below +6dB over the room — so this can only ever restore hearing, never turn room
+  // noise into speech. On a normal-level mic sigPeak*PEAK_ONSET is far above onsetT and this
+  // whole line is a no-op.
+  onsetT=Math.max(nf*ONSET_FLOOR_K, Math.min(onsetT, sigPeak*PEAK_ONSET));
   onsetT=Math.max(onsetT, silT/HYST_FRAC);                  // hysteresis is non-negotiable
   const voiceT=onsetT*CONTINUE_FRAC;
   if(rms>voiceT) lastVoiceAt=nowMs;              // generous: a quiet talker is still present
+  setThr(Math.min(1, onsetT/0.05));              // show the bar the caller has to clear
+  // ?vad=1 publishes the live decision state. Three rounds of "it isn't taking my voice" were
+  // debugged by reasoning about this code instead of reading it, and twice the reasoning was
+  // wrong; the numbers are cheap and the guessing is not.
+  if(VAD_DEBUG) window.__vad={rms, nf, silT, onsetT, voiceT, sigPeak, turnPeak, capturing,
+                              armed:armed(), silentMs:silentRun/srate*1000,
+                              quietMs:nowMs-lastVoiceAt};
   const preMax=srate*PREROLL_MS/1000;
 
   if(!capturing){
@@ -1200,10 +1303,30 @@ function onPcm(chunk){
     // junk turn, and the caller's real speech was then discarded while it was in flight. Free,
     // because capture seeds from the 300ms pre-roll ring: nothing said is lost.
     if(rms>onsetT) onsetRun+=n; else onsetRun=Math.max(0, onsetRun-n);
+    // DEAFNESS WATCHDOG. If the mic has been armed and quiet for a long stretch while sigPeak
+    // says there IS sound well above the room, the thresholds are wrong for this device and the
+    // caller is talking to a wall with nothing on screen to explain it. Say so once, and nudge
+    // the trim down — the failure mode that has now been reported three times must at minimum
+    // announce itself.
+    if(armed()){
+      if(!deafSince) deafSince=nowMs;
+      if(!deafNoted && nowMs-deafSince>9000 && sigPeak>nf*2.5){
+        deafNoted=true;
+        const s=$('sens');
+        if(s && parseFloat(s.value)>parseFloat(s.min)){
+          s.value=Math.max(parseFloat(s.min), parseFloat(s.value)-0.006).toFixed(3);
+          s.dispatchEvent(new Event('input'));
+        }
+        sysNote('🎤 I can hear sound but I\'m not registering it as speech — I\'ve turned '
+              + 'sensitivity up. If it still doesn\'t pick you up, move the mic closer or drag '
+              + 'the sensitivity slider left.');
+      }
+    }else{ deafSince=0; }
     if(armed() && onsetRun >= srate*ONSET_SUSTAIN_MS/1000){
       capturing=true; speechFrames=preRoll.slice(); preRoll=[];
       speechSamples=speechFrames.reduce((a,c)=>a+c.length,0);
       silentRun=0; recentVoiced=0; framesSinceVoiced=0; onsetRun=0;
+      turnPeak=rms; deafSince=0;                 // this turn's loudness reference starts here
       clearNoReply();
       micStreamOpen = STREAM_MIC && !httpMode && ws && ws.readyState===1;
       if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000, lang:sessionLang}); streamSent=0; streamFrameIdx=0; }
@@ -1235,7 +1358,14 @@ function onPcm(chunk){
     if(recentMs<MIN_COMPLETE_MS && turnMs<1200) endPauseMs=FRAGMENT_WAIT_MS;
     else if(turnMs>=LONG_TURN_MS)               endPauseMs=THINKING_WAIT_MS;
     const silenceEnd=srate*endPauseMs/1000, maxS=srate*MAX_TURN_MS/1000;
-    if(silentRun>=silenceEnd || speechSamples>=maxS){
+    // THREE independent ways for a turn to end, because relying on one has failed twice:
+    //  1. the tolerant silence accumulator (the good path, ~300ms after the caller stops);
+    //  2. a hard quiet timer — nothing above voiceT for HARD_QUIET_MS — which needs no
+    //     accumulator, no forgiveness arithmetic and no correct noise floor, only the caller's
+    //     own peak. This is the one that cannot be defeated;
+    //  3. MAX_TURN_MS, now 9s rather than 15s, purely as evidence that 1 and 2 both failed.
+    const hardQuiet = (nowMs-lastVoiceAt) > HARD_QUIET_MS;
+    if(silentRun>=silenceEnd || hardQuiet || speechSamples>=maxS){
       if(speechSamples>=maxS){                   // should now be unreachable — re-acquire floor
         console.warn('[vad] MAX_TURN hit; forcing noise-floor re-acquisition', {nf, silT, voiceT});
         nfBucket=Infinity; nfPrev=Infinity; nfBucketStart=nowMs;
@@ -1253,7 +1383,7 @@ function endTurn(){
   const streamed = micStreamOpen; micStreamOpen=false;
   const frames=speechFrames;
   const durMs = frames.reduce((a,c)=>a+c.length,0)/srate*1000;
-  silentRun=0; recentVoiced=0; framesSinceVoiced=0; onsetRun=0;
+  silentRun=0; recentVoiced=0; framesSinceVoiced=0; onsetRun=0; turnPeak=0;
   if(durMs<MIN_SPEECH_MS){
     speechFrames=[]; speechSamples=0;
     if(streamed) wsSend({type:'mic_abort'});   // server discards the partial buffer
