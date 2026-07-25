@@ -614,7 +614,12 @@ function broadcastCrm(r){
 function onCrm(r){
   addCrmCard(r); broadcastCrm(r);
   sysNote('✓ Logged to CRM');
-  endingCall=true;   // both scenarios wrap up after the outcome is saved
+  // WAS: endingCall=true on every row. afterPlay() hangs up the moment endingCall is set, so
+  // filing the record WAS hanging up — and the model files it whenever it has the outcome, which
+  // can be while the caller still has questions (a resolved crop problem, then "and what does it
+  // cost?"). That is the reported "call is not stopped at the right time": it stopped too early.
+  // Now the model has to say so explicitly, in the same reply as its goodbye.
+  if(r && r.closing) endingCall=true;
 }
 
 // ── UI helpers ───────────────────────────────────────────────────────────────
@@ -915,11 +920,13 @@ function onWsMessage(ev){
       if(m.state!=='idle'){ setPill(m.state); break; }
       hideTyping(); waitingForServer=false;
       dropAudioUntilIdle=false;            // the abandoned reply is over; the next one is real
-      if(m.detail==='filler'){
-        // The caller was thinking out loud ("umm…"), not finishing. Say nothing, show nothing,
-        // and give them a longer pause budget for the rest of the sentence — a visible note here
-        // would be worse than the bug, because it tells them something went wrong when nothing
-        // did. One turn only: fillerGrace is consumed the next time a turn ends.
+      if(m.detail==='incomplete' || m.detail==='filler'){
+        // The caller hasn't finished: either thinking out loud ("umm…") or stopped mid-sentence
+        // ("I need DAP and…"). Say nothing, show nothing, and give them a longer pause budget for
+        // the rest of it — a visible note here would be worse than the bug, because it tells them
+        // something went wrong when nothing did. The server holds the fragment and re-attaches it
+        // to whatever they say next, so nothing is lost by waiting. One turn only: fillerGrace is
+        // consumed the next time a turn ends.
         fillerGrace=true; endOfStream(); break;
       }
       if(m.detail==='no speech detected'){ onBrokenInput(); break; }

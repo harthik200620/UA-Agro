@@ -254,7 +254,15 @@ _ISSUE_TYPE_PRETTY = {
 
 def _crm_row(scenario: str, tool: str, args: dict) -> dict:
     a = {k: str(v).strip() for k, v in (args or {}).items() if v is not None}
-    details = json.dumps(args or {}, ensure_ascii=False)
+    # call_is_over is call CONTROL, not call data — keep it out of what the CRM page shows.
+    details = json.dumps({k: v for k, v in (args or {}).items() if k != "call_is_over"},
+                         ensure_ascii=False)
+    # WRITING THE RECORD AND ENDING THE CALL ARE DIFFERENT ACTIONS. The client used to hang up on
+    # any crm_created at all, so the moment the model filed its note — which it may legitimately
+    # do while the caller still has questions, especially log_farmer_issue right after resolving a
+    # crop problem — the caller was cut off as soon as the current line finished. The model now
+    # says explicitly whether it is also saying goodbye; absent that, the call carries on.
+    closing = str(a.get("call_is_over", "")).strip().lower() in ("true", "1", "yes")
     if tool == "log_fap_enquiry":
         status = _ENQUIRY_OUTCOME_PRETTY.get(a.get("outcome", ""), a.get("outcome", "logged"))
         bits = [a.get("product_interest"), a.get("crop"),
@@ -262,23 +270,23 @@ def _crm_row(scenario: str, tool: str, args: dict) -> dict:
                 a.get("notes")]
         return {"scenario": scenario, "kind": "enquiry", "name": a.get("name", ""),
                 "phone": a.get("phone", ""), "summary": " · ".join(b for b in bits if b),
-                "details": details, "status": status}
+                "details": details, "status": status, "closing": closing}
     if tool == "log_farmer_issue":
         kind_label = _ISSUE_TYPE_PRETTY.get(a.get("issue_type", ""), "Issue")
         status = "Resolved on call" if a.get("outcome") == "resolved_on_call" else "Needs follow-up"
         bits = [kind_label, a.get("crop"), a.get("description"), a.get("notes")]
         return {"scenario": scenario, "kind": "issue", "name": a.get("name", ""),
                 "phone": a.get("phone", ""), "summary": " · ".join(b for b in bits if b),
-                "details": details, "status": status}
+                "details": details, "status": status, "closing": closing}
     if tool == "log_rsvp":
         status = _RSVP_OUTCOME_PRETTY.get(a.get("outcome", ""), a.get("outcome", "logged"))
         bits = [a.get("guest_note"), a.get("notes")]
         return {"scenario": scenario, "kind": "rsvp", "name": a.get("name", ""),
                 "phone": a.get("phone", ""), "summary": " · ".join(b for b in bits if b),
-                "details": details, "status": status}
+                "details": details, "status": status, "closing": closing}
     return {"scenario": scenario, "kind": tool, "name": a.get("name", ""),
             "phone": a.get("phone", ""), "summary": details[:200], "details": details,
-            "status": "new"}
+            "status": "new", "closing": closing}
 
 
 def _handlers_for(scenario: str, captured: dict, on_row=None) -> dict:
@@ -286,7 +294,12 @@ def _handlers_for(scenario: str, captured: dict, on_row=None) -> dict:
     for the WS path); find_nearest_fap is a read-only lookup — its result feeds the model's
     next reply and never touches the CRM."""
     async def _save(tool: str, args: dict) -> dict:
-        row = db.insert_crm(_crm_row(scenario, tool, args))
+        payload = _crm_row(scenario, tool, args)
+        row = db.insert_crm(payload)
+        # `closing` is call CONTROL, not a CRM column, so it does not survive the DB round-trip —
+        # re-attach it for the wire. Without this the client sees closing=undefined and the call
+        # never ends on its own.
+        row["closing"] = bool(payload.get("closing"))
         captured["crm"] = row
         if on_row:
             await on_row(row)
@@ -473,6 +486,35 @@ _FILLERS = {
 _FILLER_MAX_TOKENS = 3
 
 
+# SEMANTIC END-OF-TURN. Energy VAD has been tuned three times and still cannot be "perfect",
+# because loudness cannot tell you whether a SENTENCE finished — a caller drawing breath after
+# "मुझे चाहिए और…" is silent in exactly the way a caller who has finished is silent. The transcript
+# can tell you, so it becomes the second opinion: a turn that ends on a word which cannot end a
+# sentence is not a turn, it is the first half of one.
+#
+# HIGH PRECISION ONLY. A false positive here is the agent staying silent — the very failure being
+# fixed — so this lists only words that genuinely cannot be a final word. Notably absent: "है",
+# "hai", "ok", "no", and every postposition that routinely ends real Hindi sentences.
+_DANGLING = {
+    "and", "or", "but", "because", "so", "if", "when", "that", "which", "with", "without",
+    "my", "our", "your", "the", "a", "an", "to", "of", "for", "from", "in", "on", "at", "is",
+    "और", "या", "कि", "लेकिन", "क्योंकि", "अगर", "जब", "तो", "मतलब", "यानी", "जैसे", "पर",
+    "जो", "जिस", "जिसमें", "तथा", "एवं",
+    # Sarvam's codemix mode returns romanised Hindi as often as Devanagari, so the same words
+    # have to be listed twice or half of them never match. "ki"/"की" is deliberately absent —
+    # unlike the rest it really can end a phrase, and a false hold is silence.
+    "aur", "ya", "lekin", "kyunki", "kyonki", "agar", "matlab", "yaani", "jo", "jab",
+}
+# A fragment is only worth holding for a moment. Past this the caller has plainly stopped, and
+# answering half a sentence beats leaving them in silence.
+_PENDING_MAX_AGE_S = 6.0
+
+
+def _is_incomplete(text: str) -> bool:
+    toks = re.findall(r"[\wऀ-ॿ]+", (text or "").lower())
+    return bool(toks) and len(toks) >= 2 and toks[-1] in _DANGLING
+
+
 def _is_filler(text: str) -> bool:
     toks = re.findall(r"[\wऀ-ॿ]+", (text or "").lower())
     if not toks or len(toks) > _FILLER_MAX_TOKENS:
@@ -490,11 +532,25 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
     # that follows, and Sarvam returns "umm" / "हम्म" — which used to become a full turn, so the
     # agent talked over someone who had not finished their sentence. Answer nothing, say nothing
     # visible, and tell the client to wait longer for the rest of the thought.
+    # Re-attach a fragment held from the previous turn ("I need DAP and" + "some urea" -> one
+    # sentence). Without this the held half would simply be lost, which would be worse than
+    # answering it early.
+    if not silent and state.get("pending_text"):
+        held, when = state["pending_text"]
+        state["pending_text"] = None
+        if time.time() - when <= _PENDING_MAX_AGE_S:
+            text = f"{held} {text}".strip()
+
     # `state["contents"]` empty means this is the call-opening trigger, which is answered with the
     # greeting further down. Suppressing that because the caller happened to open with "hmm" would
     # start the call in total silence — never skip the opener.
     if not silent and state["contents"] and _is_filler(text):
         await _send(ws, {"type": "status", "state": "idle", "detail": "filler"})
+        return
+    # The caller stopped mid-sentence. Hold what they said, say nothing, and wait for the rest.
+    if not silent and state["contents"] and _is_incomplete(text):
+        state["pending_text"] = (text, time.time())
+        await _send(ws, {"type": "status", "state": "idle", "detail": "incomplete"})
         return
     sid = state["session_id"]
     # End-of-speech timestamp when this turn came from the mic — the only honest zero point for

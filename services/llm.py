@@ -154,7 +154,26 @@ def _is_gemini3(model: str) -> bool:
     return model.startswith("gemini-3")
 
 
-def _thinking_config_for(model: str) -> dict | None:
+# WHICH TURNS DESERVE REAL THINKING. thinkingLevel "minimal" is 1.62s and "low" is 2.99s
+# (measured), so depth is not free and must not be spent on every turn. A price or a stock check
+# needs no reasoning — the answer is in the prompt. Diagnosing "white insects on my tomatoes" does:
+# it has to pick a product, a dose and a timing, and being wrong there costs a farmer a crop.
+# Deliberately does NOT include "how much"/"how many", which is nearly always a price question.
+_DEEP_TURN = re.compile(
+    r"कीड़|कीड|इल्ली|सुंडी|बीमार|रोग|फफूंद|पीले|पीला|सूख|मुरझा|धब्बे|सड़|खराब|नुकसान"
+    r"|कौन\s*सी|कौन\s*सा|कैसे|कैसी|क्यों|कितना\s*डाल|कब\s*डाल|छिड़क|मात्रा"
+    r"|\b(?:which|why|how\s+to|how\s+do|how\s+should|dose|dosage|spray|apply)\b"
+    r"|\b(?:pest|insect|worm|disease|fungus|blight|rot|wilt|yellowing|dying|damag|infest)"
+    r"|\bnot\s+working\b|\bproblem\b|\bissue\b",
+    re.IGNORECASE)
+
+
+def _effort_for(user_text: str) -> str:
+    """'deep' only where reasoning changes the answer — see _DEEP_TURN."""
+    return "deep" if _DEEP_TURN.search(user_text or "") else "fast"
+
+
+def _thinking_config_for(model: str, effort: str = "fast") -> dict | None:
     """Gemini 3 models think BY DEFAULT and their thoughts share the output-token pool: with a
     small cap the thoughts (~200 tokens) ate the whole budget and replies came out TRUNCATED.
     So 3-series gets thinkingLevel "minimal" (fastest valid level — budget knobs are 2.5-era
@@ -163,7 +182,7 @@ def _thinking_config_for(model: str) -> dict | None:
     argument; thinkingLevel minimal → ~1.2s; NO config → ~4s because default thinking turns
     on) — so -latest is treated as 3-series, never given a budget."""
     if _is_gemini3(model) or model.endswith("-latest"):
-        return {"thinkingLevel": "minimal"}
+        return {"thinkingLevel": "low" if effort == "deep" else "minimal"}
     if "2.5" in model:
         eff = 0 if "lite" in model.lower() else _THINKING_BUDGET
         return {"thinkingBudget": eff}
@@ -316,7 +335,8 @@ _cooldown: dict[int, float] = {}
 
 
 async def _generate(contents: list, scenario: str = "lead", lang: str = "",
-                    force_tool: bool = False, hedge: bool = True) -> dict:
+                    force_tool: bool = False, hedge: bool = True,
+                    effort: str = "fast") -> dict:
     global _fresh_idx, _other_idx, last_attempt_count, last_served_by
     if not _KEYS:
         raise RuntimeError("No Gemini API key set")
@@ -341,7 +361,7 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
         if _LAST_RESORT_MODEL and last_attempt_count >= _LAST_RESORT_AFTER:
             model = _LAST_RESORT_MODEL
         gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
-        thinking = _thinking_config_for(model)
+        thinking = _thinking_config_for(model, effort)
         if thinking:
             gen_config["thinkingConfig"] = thinking
         return model, {
@@ -424,7 +444,7 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
                     continue
                 model = _model_for_key_idx(key_idx)
                 gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
-                thinking = _thinking_config_for(model)
+                thinking = _thinking_config_for(model, effort)
                 if thinking:
                     gen_config["thinkingConfig"] = thinking
                 body = {
@@ -587,7 +607,16 @@ def _echoes_record(spoken: str, args: dict | None) -> bool:
     if len(want) < 5:
         return False
     have = {w.lower() for w in _WORD.findall(spoken or "")}
-    return len(want & have) / len(want) >= 0.7
+    # MEASURED REGRESSION, tightened from 0.7 with no length test. log_farmer_issue's `notes` is
+    # defined as "summary of the issue AND WHAT YOU TOLD THEM", so a GOOD piece of advice
+    # legitimately overlaps it almost completely — and this guard was throwing that advice away
+    # and speaking a canned "try that, you should see the difference" instead. It made the agent
+    # dumbest on exactly the turns where being useful matters most.
+    # A genuine readback is near-verbatim AND no longer than what it reads back; real advice adds
+    # words. Both conditions must hold now, so length alone rescues the useful case.
+    if len(have) > len(want) * 1.4:
+        return False
+    return len(want & have) / len(want) >= 0.9
 
 
 def _speakable(s: str) -> str:
@@ -696,7 +725,8 @@ async def _sse_pump(key_idx: int, model: str, body: dict, out: asyncio.Queue, ta
 
 
 async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "",
-                           force_tool: bool = False, on_clause=None) -> dict:
+                           force_tool: bool = False, on_clause=None,
+                           effort: str = "fast") -> dict:
     """Streaming twin of _generate(): same inputs, and deliberately the SAME return shape.
 
     The only difference is that complete clauses are handed to `on_clause` the moment they are
@@ -724,7 +754,7 @@ async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "
         if _LAST_RESORT_MODEL and last_attempt_count >= _LAST_RESORT_AFTER:
             model = _LAST_RESORT_MODEL
         gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
-        thinking = _thinking_config_for(model)
+        thinking = _thinking_config_for(model, effort)
         if thinking:
             gen_config["thinkingConfig"] = thinking
         return model, {
@@ -917,6 +947,10 @@ async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: 
     # The client's close note names the tool it needs ("… CALL log_fap_enquiry …" / "… CALL
     # log_rsvp …") — force function-calling on those turns so the outcome is ALWAYS recorded.
     force_tool = "(System note" in (user_text or "") and "CALL " in (user_text or "")
+    # Spend reasoning depth only where it changes the answer (see _DEEP_TURN). Decided from what
+    # the caller just SAID, before the request goes out, so it costs nothing to compute and the
+    # fast path stays exactly as fast as it was.
+    effort = _effort_for(user_text)
 
     for turn_i in range(5):  # allow a couple of tool round-trips
         try:
@@ -926,13 +960,13 @@ async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: 
                 # Gemini round-trip the caller would otherwise sit through in silence.
                 data = await _generate_stream(contents, scenario, lang,
                                               force_tool=force_tool and last_tool is None,
-                                              on_clause=on_clause)
+                                              on_clause=on_clause, effort=effort)
             else:
                 # Hedge only the first call of the turn — tool-followup calls are rare and the
                 # racing setup isn't worth doubling their quota cost.
                 data = await _generate(contents, scenario, lang,
                                        force_tool=force_tool and last_tool is None,
-                                       hedge=turn_i == 0)
+                                       hedge=turn_i == 0, effort=effort)
         except Exception:
             # If a tool already saved this turn, give a graceful spoken confirmation instead
             # of surfacing a raw error (e.g. when the follow-up call hits a Gemini 429).

@@ -124,14 +124,21 @@ _LANG_RULE = """\
 English and Hindi and any mix. The ONLY exception: if the {who} clearly switches to the other
 language and keeps speaking it, switch with them and continue in that language.
 
-#2 RULE — SHORT AND SMART. HARD CAP: ONE sentence, UNDER 12 words — count them before you
-speak. Answer first, then at most ONE pointed question. A second SHORT sentence is allowed
-ONLY when closing the call. Plain spoken words a sharp professional uses — never corporate
-phrases ("I completely understand", "kindly", "as per"), never hedging, never explaining,
-never listing, never repeating the {who}'s words, never thanking twice, never stacking
-questions. If a reply can lose a word, lose it. THE LENGTH TO HIT, exactly this size:
-"यूरिया की बोरी दो सौ छियासठ रुपये की है — कितनी चाहिए?" · "Which crop do you have ready to
-sell?" · "बहुत बढ़िया जी — तो रविवार को मिलते हैं।" Anything two times this long is a failure.
+#2 RULE — SHORT, BUT ACTUALLY ANSWER. Length follows the QUESTION; it is not a fixed cap.
+
+- A price, a fact, a confirmation, a yes/no → ONE sentence, about 12 words:
+  "यूरिया की बोरी दो सौ छियासठ रुपये की है — कितनी चाहिए?" · "Which crop do you have ready to
+  sell?" · "बहुत बढ़िया जी — तो रविवार को मिलते हैं।"
+- They asked WHICH / HOW / WHY / HOW MUCH TO USE, or described a crop problem → up to TWO
+  sentences, about 30 words. Name the product AND what to actually do with it — the dose, the
+  timing, the catch. A farmer who has to ask a second time has been failed, not served briefly:
+  "सफ़ेद कीड़ों के लिए इमिडाक्लोप्रिड लीजिए — एक एकड़ में आधा लीटर, शाम को छिड़काव कीजिए।"
+
+Never more than two sentences, ever. Plain spoken words a sharp professional uses — never
+corporate phrases ("I completely understand", "kindly", "as per"), never hedging, never listing,
+never repeating the {who}'s words back, never thanking twice, never stacking questions. Brevity
+applies to the WORDS, never to the substance: cut adjectives and filler, never cut the part that
+answers them. Answer first, then at most ONE pointed question.
 
 #3 RULE — DELIVERY. Your reply is read aloud verbatim, so write ONLY the words meant to be
 heard: no stage directions, no emojis, no asterisks, no [bracketed] tags, no markdown, and NO
@@ -154,6 +161,12 @@ NEVER close, and NEVER call your record tool, in the same turn as an unanswered 
 question — catch yourself and answer it instead. (Whenever you do close — including a Rule #7
 forced close — still record the call in the CRM exactly as your flow requires; the goodbye
 never replaces the tool call.)
+RECORDING IS NOT HANGING UP. Your record tool takes `call_is_over`. Set it TRUE only when this
+same reply is your goodbye and the conversation is genuinely finished. Set it FALSE whenever you
+are filing the outcome but the caller is still there — you have just resolved their problem, or
+answered them and they may well ask something else. A FALSE that should have been TRUE costs a
+few seconds; a TRUE that should have been FALSE hangs up on a customer mid-sentence. When in
+doubt, FALSE.
 
 #5 RULE — THINK, THEN SPEAK (be wise, not a bot). Before every reply, work out what the {who}
 REALLY means — their intent AND their mood — then answer the way a seasoned, emotionally-aware
@@ -472,6 +485,8 @@ LOG_FAP_ENQUIRY_TOOL = {
             "phone": {"type": "string",
                        "description": "Caller's phone ONLY if they offered it; leave empty otherwise — never invent one"},
             "notes": {"type": "string", "description": "One-line summary of the call"},
+            "call_is_over": {"type": "boolean",
+                "description": "TRUE only if you are ALSO saying goodbye in this very reply and the conversation is finished. FALSE if you are recording the outcome but the caller is still on the line — you have just answered them, or they may still ask something. Getting this wrong hangs up on a caller mid-conversation, so when in doubt use FALSE: a call that runs a few seconds long is recoverable, one that cuts the customer off is not."},
         },
         "required": ["outcome"],
     },
@@ -518,6 +533,8 @@ LOG_FARMER_ISSUE_TOOL = {
             "phone": {"type": "string",
                        "description": "Caller's phone ONLY if they offered it — ask for it naturally when outcome is needs_followup so the store can call back; leave empty otherwise — never invent one"},
             "notes": {"type": "string", "description": "One-line summary of the issue and what you told them"},
+            "call_is_over": {"type": "boolean",
+                "description": "TRUE only if you are ALSO saying goodbye in this very reply and the conversation is finished. FALSE if you are recording the outcome but the caller is still on the line — you have just answered them, or they may still ask something. Getting this wrong hangs up on a caller mid-conversation, so when in doubt use FALSE: a call that runs a few seconds long is recoverable, one that cuts the customer off is not."},
         },
         "required": ["issue_type", "outcome"],
     },
@@ -546,6 +563,8 @@ LOG_RSVP_TOOL = {
             },
             "guest_note": {"type": "string", "description": "If they want to bring neighbours/others, note it here; empty otherwise"},
             "notes": {"type": "string", "description": "One-line summary of the call"},
+            "call_is_over": {"type": "boolean",
+                "description": "TRUE only if you are ALSO saying goodbye in this very reply and the conversation is finished. FALSE if you are recording the outcome but the caller is still on the line — you have just answered them, or they may still ask something. Getting this wrong hangs up on a caller mid-conversation, so when in doubt use FALSE: a call that runs a few seconds long is recoverable, one that cuts the customer off is not."},
         },
         "required": ["outcome"],
     },
