@@ -86,6 +86,11 @@
     background:radial-gradient(circle at 32% 26%, #6EE8A8, var(--green) 62%, var(--green-deep) 100%);
     animation:dotpulse 1.7s var(--ease) infinite;
     transform:scale(calc(1 + var(--amp) * .4))}
+  .langsw{display:inline-flex;gap:2px;margin-left:10px;padding:2px;border-radius:999px;
+    background:rgba(20,15,50,.07);vertical-align:middle}
+  .langsw button{border:0;cursor:pointer;font:inherit;font-size:11px;font-weight:700;
+    padding:5px 12px;border-radius:999px;background:transparent;color:var(--muted);line-height:1}
+  .langsw button.on{background:var(--brand);color:#fff;box-shadow:var(--shadow-sm)}
   /* Live mic level. Without this a caller has no way to tell "the agent is thinking" apart from
      "the agent cannot hear me at all" — the single most confusing failure in a voice demo. */
   .meter{display:inline-block;width:70px;height:7px;border-radius:4px;vertical-align:middle;
@@ -269,6 +274,13 @@
     <div class="panel panel-convo">
       <div class="phead">
         <span class="ttl" id="convoTitle">Live conversation</span>
+        <!-- Live language switch. The picker's chips are a small target inside a large card, so a
+             mistap silently ran the whole call in the card's default language with no visible
+             sign. Here the active language is always shown and always correctable. -->
+        <span class="langsw" id="langsw">
+          <button type="button" data-lang="english">English</button
+          ><button type="button" data-lang="hindi">हिंदी</button>
+        </span>
         <span class="meta" id="langmeta"></span>
       </div>
       <div class="convo" id="convo">
@@ -423,6 +435,7 @@ function chooseScenario(s, l){
   $('brandSub').innerHTML = p.sub + ' · ' + langLabel();
   $('convoTitle').textContent = p.convoTitle;
   $('langmeta').textContent = p.who + ' · ' + langLabel();
+  renderLangSwitch();
   if($('greetBig'))  $('greetBig').textContent = p.big;
   if($('greetHint')) $('greetHint').innerHTML  = hintNow();
   $('hint').innerHTML = hintNow();
@@ -439,6 +452,33 @@ function chooseScenario(s, l){
 // Pay the connection costs while the caller is still reading the scenario card. The WS handshake
 // (TCP + TLS + HTTP upgrade) and the AudioWorklet module fetch both used to land on the
 // "Answer call" click, where they are pure dead air on the critical path.
+// ── Live language switch (call header) ───────────────────────────────────────
+// The picker's chips are a ~72x30px target inside a large card, so `e.target.closest('.chip')`
+// misses on most taps and silently falls back to the card's default — Hindi. Nothing in the UI
+// showed which language was actually active, so an English call could run entirely in Hindi with
+// no visible sign. This makes the active language always visible and always correctable.
+function renderLangSwitch(){
+  const sw=$('langsw'); if(!sw) return;
+  sw.querySelectorAll('button').forEach(b=> b.classList.toggle('on', b.dataset.lang===sessionLang));
+}
+async function setLanguage(l){
+  if(!LANGS[l] || l===sessionLang) return;
+  sessionLang=l;
+  renderLangSwitch();
+  $('brandSub').innerHTML = pack().sub + ' · ' + langLabel();
+  $('langmeta').textContent = pack().who + ' · ' + langLabel();
+  $('hint').innerHTML = hintNow();
+  if(recog){ try{ recog.lang = langCode(); }catch(e){} }
+  wsSend({type:'set_lang', lang:sessionLang});          // server keeps the conversation, swaps language
+  ackClips.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} });
+  openerData=null; openerPromise=null; ackClips=[]; ackLast=-1;
+  try{ await getOpening(); await loadAcks(); }catch(e){}
+  sysNote(l==='hindi' ? '🗣️ अब हिंदी में — बोलिए।' : '🗣️ Switched to English — go ahead.');
+}
+if($('langsw')) $('langsw').onclick = (e)=>{
+  const b=e.target.closest('button'); if(b) setLanguage(b.dataset.lang);
+};
+
 function warmUp(){
   try{ ensureWS(true); }catch(e){}                                   // fire and forget
   try{ fetch('/static/pcm-worklet.js',{cache:'force-cache'}).catch(()=>{}); }catch(e){}
@@ -758,6 +798,11 @@ function onBrokenInput(){
   clearAudioQueue();
   if(!listening){ setPill('idle'); return; }
   if(endingCall){ endCall(); return; }
+  // An empty transcript used to render NOTHING — no bubble, no error, no toast — which is why
+  // "it didn't catch that" was indistinguishable from "the app is completely dead".
+  sysNote(sessionLang==='hindi'
+    ? '🎤 आवाज़ साफ़ नहीं आई — ज़रा पास से, दोबारा बोलिए।'
+    : '🎤 Didn\'t catch that — speak a little closer and try again.');
   rearm();
   if(noReplyCount < 2){ triggerReask(); }
   else if(!closeRequested){ closeRequested=true; sendSilent(closeNote()); }
@@ -944,13 +989,22 @@ async function sendTyped(){
 }
 
 // ── Mic capture (Sarvam path): AudioWorklet + energy VAD + WAV encode ─────────
-let capturing=false, speechFrames=[], preRoll=[], silentSamples=0, speechSamples=0, voicedSamples=0, srate=48000;
+let capturing=false, speechFrames=[], preRoll=[], speechSamples=0, srate=48000;
+// VAD working state. `silentSamples`/`voicedSamples`/`noiseFloor` are RETIRED — see onPcm.
+let nfBucket=Infinity, nfPrev=Infinity, nfBucketStart=0;   // sliding-minimum noise floor
+let onsetRun=0, silentRun=0, recentVoiced=0, framesSinceVoiced=0, rvDecay=0.998;
 // VAD threshold cached from the slider (see its input handler) and the level meter coalesced to
 // one style write per frame paint. Both used to run per 128-sample audio frame — ~375×/sec of
 // DOM reads and layout-invalidating style writes on the thread that also runs the VAD and
 // schedules playback.
 let sensVal=parseFloat(($('sens')||{}).value)||0.02, _ampVal=0, _ampRaf=0, micFrames=0;
-let noiseFloor=0.004;
+let onPcmErrShown=false;
+function onPcmFailed(err){
+  if(onPcmErrShown) return;
+  onPcmErrShown=true;
+  console.error('[vad] onPcm threw — microphone processing has stopped', err);
+  sysNote('🎤 Something went wrong reading the microphone — please reload the page. You can keep typing below in the meantime.');
+}
 function setAmp(v){
   _ampVal=v;
   if(_ampRaf) return;
@@ -958,17 +1012,25 @@ function setAmp(v){
     document.documentElement.style.setProperty('--amp', _ampVal.toFixed(3)); });
 }
 // MIN_SPEECH 180 (was 300): real one-word answers ("हाँ", "yes") were being discarded as
-// non-speech.
-// MIN_COMPLETE 250 (was 700) + FRAGMENT_WAIT 700 (was 1100): the pair below was INVERTED.
-// voicedSamples only counts frames above the threshold, so a one-word answer — "हाँ", a digit,
-// "ठीक है" — carries only ~250-400ms of voiced audio, fell under a 700ms MIN_COMPLETE, and was
-// classed an unfinished fragment. The fastest and most common answers therefore waited 1100ms
-// to end the turn while a long rambling one waited 420ms. At 250 a real one-word reply takes
-// the fast branch, and only a genuine sub-250ms blip still gets the longer "they're mid-thought"
-// grace. SILENCE_END 350: this hold is now the largest remaining client-side wait, tuned as
-// tight as Hindi mid-sentence pauses allow (verified against real speech, see round notes).
+// non-speech. SILENCE_END 350 is the common-case end-of-turn hold, tuned against real Hindi.
+// MIN_COMPLETE is now measured against RECENT voice (see recentVoiced), not a cumulative total —
+// as a cumulative counter it cleared after the first syllable and FRAGMENT_WAIT was dead code.
+// THINKING_WAIT applies only past LONG_TURN_MS, because that is where recall pauses live (a
+// price, a quantity, a village name) and being cut off mid-number is far worse than +200ms.
 const PREROLL_MS=300, SILENCE_END_MS=350, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
 const MIN_COMPLETE_MS=250, FRAGMENT_WAIT_MS=700;
+const LONG_TURN_MS=2500, THINKING_WAIT_MS=550;
+// Noise-floor window and its clamps. NF_MIN is roughly a decent mic's residual self-noise after
+// noiseSuppression — below it, thresholds derived from the floor become absurd. NF_MAX stops a
+// genuinely loud shop from pushing the onset threshold beyond any speaker's reach: occasional
+// false captures are recoverable (MIN_SPEECH_MS discards them), deafness is not.
+const NF_WINDOW_MS=1500, NF_MIN=0.0015, NF_MAX=0.02;
+// SIL_K +5.1dB clears the ±3-4dB non-stationarity of a real room. START_K +12dB is the
+// conservative "unambiguously voice" margin. HYST_FRAC guarantees >=6.9dB between them in every
+// corner, so the slider trim can never push the thresholds back down into the room.
+const SIL_K=1.8, SIL_ABS_MIN=0.0025, START_K=4.0, START_MIN=0.005, START_MAX=0.09;
+const HYST_FRAC=0.45, CONTINUE_FRAC=0.70;
+const ONSET_SUSTAIN_MS=60, SIL_FORGIVE=3.0, NEUTRAL_AS_SILENCE_MS=900, RV_TAU_MS=1200;
 
 async function startMic(){
   try{
@@ -996,7 +1058,9 @@ async function startMic(){
     await audioCtx.audioWorklet.addModule('/static/pcm-worklet.js');
     sourceNode = audioCtx.createMediaStreamSource(micStream);
     workletNode = new AudioWorkletNode(audioCtx,'pcm-processor');
-    workletNode.port.onmessage = e => onPcm(e.data);
+    // A throw inside onPcm would otherwise be swallowed once per frame and the mic would go dead
+    // in complete silence — the exact failure this file has already been burned by twice.
+    workletNode.port.onmessage = e => { try{ onPcm(e.data); }catch(err){ onPcmFailed(err); } };
     sourceNode.connect(workletNode);
     workletNode.connect(audioCtx.destination);
   }catch(e){
@@ -1016,7 +1080,12 @@ async function startMic(){
             + 'or just type your question below.');
     }, 1800);
   }, 1800);
-  capturing=false; speechFrames=[]; preRoll=[]; silentSamples=0; speechSamples=0; voicedSamples=0;
+  capturing=false; speechFrames=[]; preRoll=[]; speechSamples=0;
+  // Re-acquire the room from scratch on every call, and derive the recent-voice decay from the
+  // ACTUAL frame size now that srate is known (a frame is 128 samples).
+  nfBucket=Infinity; nfPrev=Infinity; nfBucketStart=performance.now();
+  onsetRun=0; silentRun=0; recentVoiced=0; framesSinceVoiced=0;
+  rvDecay=Math.exp(-(128/srate*1000)/RV_TAU_MS);
 }
 function stopMic(){
   try{ if(workletNode){workletNode.port.onmessage=null; workletNode.disconnect();} }catch(e){}
@@ -1097,38 +1166,82 @@ function onPcm(chunk){
   let sum=0; for(let i=0;i<n;i++){ const s=chunk[i]; sum+=s*s; }
   const rms=Math.sqrt(sum/n);
   setAmp(Math.min(1, rms/0.05));
-  // ADAPTIVE THRESHOLD. A single absolute number cannot serve a laptop mic, a phone held at
-  // arm's length and a noisy shop counter alike — and when the caller's mic simply runs quieter
-  // than the fixed 0.016, capture NEVER triggers and the agent appears deaf with no clue why.
-  // Track the quiet level and trigger on a clear rise above it, capped by the slider so the
-  // effective threshold is only ever MORE sensitive than what the user asked for, never less.
-  if(!capturing){
-    noiseFloor = rms < noiseFloor ? (noiseFloor*0.9 + rms*0.1) : (noiseFloor*0.995 + rms*0.005);
-  }
-  const startT=Math.min(sensVal, Math.max(0.006, noiseFloor*4));
-  const silT=startT*0.6;
-  if(rms>startT) lastVoiceAt=performance.now();   // proof the caller is still there
+
+  // ── NOISE FLOOR: two-bucket sliding MINIMUM ────────────────────────────────
+  // The previous one-pole tracker collapsed toward ZERO instead of settling on the room level
+  // (measured: noiseFloor=0.00000 with an audible noise bed present), which pinned the silence
+  // threshold at its absolute minimum — below almost any real room. Silence then never
+  // accumulated, the turn only ended at MAX_TURN_MS, and the agent appeared deaf for 15s.
+  // A true minimum cannot be dragged up by the caller's own voice, so unlike the old tracker it
+  // is safe to run DURING capture — which is exactly what lets it follow a phone's auto-gain as
+  // the AGC raises the room during the very pause we are trying to detect.
+  const nowMs=performance.now();
+  if(nowMs-nfBucketStart >= NF_WINDOW_MS/2){ nfPrev=nfBucket; nfBucket=Infinity; nfBucketStart=nowMs; }
+  if(rms<nfBucket) nfBucket=rms;
+  const nf=Math.min(NF_MAX, Math.max(NF_MIN, Math.min(nfBucket, nfPrev)));
+
+  // ── THREE THRESHOLDS, derived floor-first ──────────────────────────────────
+  // silT is derived from the ROOM and the slider can never touch it. That is the whole fix:
+  // previously silT inherited the slider cap, stopped tracking the room, and any room noisier
+  // than 0.6*slider could never register silence.
+  const trim=Math.max(0.5, Math.min(2.0, sensVal/0.016));   // slider = +/-1 octave of trim
+  const silT=Math.max(nf*SIL_K, SIL_ABS_MIN);
+  let onsetT=Math.max(START_MIN, Math.min(START_MAX, nf*START_K*trim));
+  onsetT=Math.max(onsetT, silT/HYST_FRAC);                  // hysteresis is non-negotiable
+  const voiceT=onsetT*CONTINUE_FRAC;
+  if(rms>voiceT) lastVoiceAt=nowMs;              // generous: a quiet talker is still present
   const preMax=srate*PREROLL_MS/1000;
 
   if(!capturing){
     preRoll.push(chunk);
     let total=preRoll.reduce((a,c)=>a+c.length,0);
     while(total>preMax && preRoll.length>1){ total-=preRoll.shift().length; }
-    if(armed() && rms>startT){
+    // Onset needs SUSTAIN, not one 2.7ms frame — a door slam or keyboard tap used to start a
+    // junk turn, and the caller's real speech was then discarded while it was in flight. Free,
+    // because capture seeds from the 300ms pre-roll ring: nothing said is lost.
+    if(rms>onsetT) onsetRun+=n; else onsetRun=Math.max(0, onsetRun-n);
+    if(armed() && onsetRun >= srate*ONSET_SUSTAIN_MS/1000){
       capturing=true; speechFrames=preRoll.slice(); preRoll=[];
-      speechSamples=speechFrames.reduce((a,c)=>a+c.length,0); silentSamples=0; voicedSamples=0;
+      speechSamples=speechFrames.reduce((a,c)=>a+c.length,0);
+      silentRun=0; recentVoiced=0; framesSinceVoiced=0; onsetRun=0;
       clearNoReply();
       micStreamOpen = STREAM_MIC && !httpMode && ws && ws.readyState===1;
-      if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000}); streamSent=0; streamFrameIdx=0; }
+      if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000, lang:sessionLang}); streamSent=0; streamFrameIdx=0; }
     }
   }else{
     speechFrames.push(chunk); speechSamples+=n;
     if(micStreamOpen) pumpMicStream(false);
-    if(rms<silT){ silentSamples+=n; } else { silentSamples=0; voicedSamples+=n; }
-    const voicedMs=voicedSamples/srate*1000;
-    const endPauseMs=(voicedMs>=MIN_COMPLETE_MS)?SILENCE_END_MS:FRAGMENT_WAIT_MS;
+    // TOLERANT silence. Voice ERODES the run instead of zeroing it: one AGC-boosted breath
+    // 340ms into a 350ms pause used to wipe the whole thing and the turn never ended. Erasing a
+    // full run now costs ~a syllable of continuous speech, while a stray click costs 3x its own
+    // length. Frames in the neutral band are evidence for neither — but after
+    // NEUTRAL_AS_SILENCE_MS they count as silence, which bounds the worst case at ~1.25s
+    // instead of the 15s cap.
+    if(rms>=voiceT){
+      silentRun=Math.max(0, silentRun-n*SIL_FORGIVE); recentVoiced+=n; framesSinceVoiced=0;
+    }else if(rms<silT){
+      silentRun+=n; framesSinceVoiced++;
+    }else{
+      framesSinceVoiced++;
+      if(framesSinceVoiced*(n/srate*1000) > NEUTRAL_AS_SILENCE_MS) silentRun+=n;
+    }
+    recentVoiced*=rvDecay;                       // "how much voice in the last ~1.2s"
+    const recentMs=recentVoiced/srate*1000, turnMs=speechSamples/srate*1000;
+    // A working mid-thought grace. voicedSamples used to be CUMULATIVE, so it cleared
+    // MIN_COMPLETE_MS after the first syllable and the fragment branch was dead code forever
+    // after. Long turns get a longer pause budget, because that is where recall pauses live —
+    // a price, a quantity, a village name — and being cut off mid-number is the worst outcome.
+    let endPauseMs=SILENCE_END_MS;
+    if(recentMs<MIN_COMPLETE_MS && turnMs<1200) endPauseMs=FRAGMENT_WAIT_MS;
+    else if(turnMs>=LONG_TURN_MS)               endPauseMs=THINKING_WAIT_MS;
     const silenceEnd=srate*endPauseMs/1000, maxS=srate*MAX_TURN_MS/1000;
-    if(silentSamples>=silenceEnd || speechSamples>=maxS){ endTurn(); }
+    if(silentRun>=silenceEnd || speechSamples>=maxS){
+      if(speechSamples>=maxS){                   // should now be unreachable — re-acquire floor
+        console.warn('[vad] MAX_TURN hit; forcing noise-floor re-acquisition', {nf, silT, voiceT});
+        nfBucket=Infinity; nfPrev=Infinity; nfBucketStart=nowMs;
+      }
+      endTurn();
+    }
   }
 }
 function endTurn(){
@@ -1140,7 +1253,7 @@ function endTurn(){
   const streamed = micStreamOpen; micStreamOpen=false;
   const frames=speechFrames;
   const durMs = frames.reduce((a,c)=>a+c.length,0)/srate*1000;
-  silentSamples=0; voicedSamples=0;
+  silentRun=0; recentVoiced=0; framesSinceVoiced=0; onsetRun=0;
   if(durMs<MIN_SPEECH_MS){
     speechFrames=[]; speechSamples=0;
     if(streamed) wsSend({type:'mic_abort'});   // server discards the partial buffer
@@ -1234,50 +1347,156 @@ let audioQ=[], qActive=false, streamDone=false, audioEpoch=0;
 // leaves an audible 30-120ms hole between chunks — and, crucially, can't start until a whole
 // self-contained audio file has arrived. This path starts on the FIRST frame. Used whenever the
 // server announces streaming:true; the blob queue stays for the opener and the HTTP fallback.
-let pcmStreaming=false, pcmRate=24000, pcmNext=0, pcmCtx=null, pcmNodes=[], pcmGuard=null;
+let pcmStreaming=false, pcmRate=24000, pcmNext=0, pcmCtx=null, pcmGain=null, pcmNodes=[], pcmGuard=null;
+const PCM_RATE_HINT=24000;          // must match tts.py's _STREAM_FORMAT default
+const PREBUFFER_MS=120, PREBUFFER_MAX_WAIT_MS=200, TARGET_LATENCY_MS=120, MAX_REBASE_LEAD_MS=300;
+const FADE_IN_MS=8, FADE_OUT_MS=12;
+let pcmPending=[], pcmPendingSamples=0, pcmStarted=false, pcmFirstArrivalAt=0, pcmUnderruns=0;
+let pcmHoldTimer=null;
+let rsHist=new Float32Array(3), rsPhase=3.0;
+
 function pcmContext(){
-  if(!pcmCtx || pcmCtx.state==='closed'){ pcmCtx=new (window.AudioContext||window.webkitAudioContext)(); }
+  if(!pcmCtx || pcmCtx.state==='closed'){
+    const AC=window.AudioContext||window.webkitAudioContext;
+    // Ask for the stream's own rate so the graph does no resampling at all. Browsers may refuse,
+    // which is why the resampler below always exists.
+    try{ pcmCtx=new AC({sampleRate:PCM_RATE_HINT, latencyHint:'interactive'}); }
+    catch(e){ pcmCtx=new AC(); }
+    pcmGain=pcmCtx.createGain(); pcmGain.gain.value=1; pcmGain.connect(pcmCtx.destination);
+  }
   if(pcmCtx.state==='suspended'){ try{ pcmCtx.resume(); }catch(e){} }
   return pcmCtx;
 }
-function pcmBegin(rate){ pcmRate=rate||24000; pcmNext=0; streamDone=false; }
+
+// ── Stateful resampler ───────────────────────────────────────────────────────
+// THE cause of "the output is breaking". Buffers used to be created at the STREAM's rate (24k)
+// on a context running at the hardware rate — 44100 on most laptops and phones. The browser
+// resamples each AudioBuffer INDEPENDENTLY, carrying no filter state or fractional phase across
+// buffers, so every single frame join was a step discontinuity: 12-50 broadband clicks a second,
+// constant, and completely independent of the network. It is inaudible at 48000 (ratio exactly
+// 2.0) which is why it never reproduced in testing and was obvious on real hardware.
+// Carrying 3 samples of history plus the fractional phase is precisely what the browser fails to
+// do. Catmull-Rom rather than linear: this is always upsampling, so accuracy is all that matters.
+function rsReset(){ rsHist=new Float32Array(3); rsPhase=3.0; }
+function resampleTo(src, ratio){
+  if(ratio===1) return src;
+  const w=new Float32Array(3+src.length);
+  w.set(rsHist,0); w.set(src,3);
+  const out=[]; let p=rsPhase;
+  while(p+2 < w.length){
+    const i=Math.floor(p), f=p-i;
+    const a=w[i-1], b=w[i], c=w[i+1], d=w[i+2];
+    out.push(0.5*((2*b)+(-a+c)*f+(2*a-5*b+4*c-d)*f*f+(-a+3*b-3*c+d)*f*f*f));
+    p+=ratio;
+  }
+  rsPhase = p-(w.length-3);
+  rsHist = w.slice(w.length-3);
+  return Float32Array.from(out);
+}
+
+function pcmBegin(rate){
+  pcmRate=rate||PCM_RATE_HINT; pcmNext=0; streamDone=false;
+  pcmPending=[]; pcmPendingSamples=0; pcmStarted=false; pcmFirstArrivalAt=0; pcmUnderruns=0;
+  rsReset();
+}
 function pcmPush(buf){
-  clearFiller();                     // the real reply is starting — stop covering for it
   const ctx=pcmContext();
   const pcm=new Int16Array(buf);
   if(!pcm.length) return;
-  const ab=ctx.createBuffer(1, pcm.length, pcmRate);
-  const ch=ab.getChannelData(0);
-  for(let i=0;i<pcm.length;i++) ch[i]=pcm[i]/32768;
-  const src=ctx.createBufferSource(); src.buffer=ab; src.connect(ctx.destination);
-  // 80ms lead-in on the first frame absorbs network jitter; every later frame starts exactly
-  // where the previous one ends, which is what makes it seamless rather than stitched.
+  const f=new Float32Array(pcm.length);
+  for(let i=0;i<pcm.length;i++) f[i]=pcm[i]/32768;
+  const chunk=resampleTo(f, pcmRate/ctx.sampleRate);
+  pcmPending.push(chunk); pcmPendingSamples+=chunk.length;
+  playing=true; setPill('speaking');
+  if(!pcmStarted){
+    // Hold a small cushion before the first sample. Frames arrive 20-85ms apart and the gap after
+    // ElevenLabs' first flushed clause is routinely 80-150ms, so starting on frame 1 guaranteed an
+    // immediate underrun. The timer is essential, not belt-and-braces: a reply SHORTER than the
+    // cushion sends no further frames, so without it that audio would sit in the buffer forever
+    // and the caller would hear nothing at all.
+    if(!pcmFirstArrivalAt) pcmFirstArrivalAt=performance.now();
+    const ready = pcmPendingSamples >= ctx.sampleRate*PREBUFFER_MS/1000;
+    if(!ready && performance.now()-pcmFirstArrivalAt < PREBUFFER_MAX_WAIT_MS){
+      if(!pcmHoldTimer) pcmHoldTimer=setTimeout(()=>{
+        pcmHoldTimer=null;
+        if(!pcmStarted && pcmPendingSamples){ pcmStarted=true; pcmFlush(pcmContext()); }
+      }, PREBUFFER_MAX_WAIT_MS);
+      return;
+    }
+    pcmStarted=true;
+  }
+  if(pcmHoldTimer){ clearTimeout(pcmHoldTimer); pcmHoldTimer=null; }
+  pcmFlush(ctx);
+}
+function pcmFlush(ctx){
+  if(!pcmPendingSamples) return;
   const now=ctx.currentTime;
-  if(pcmNext < now+0.02) pcmNext = now+0.08;
-  src.start(pcmNext);
-  pcmNext += ab.duration;
+  let fadeIn=false;
+  // Re-base ONLY on a genuine underrun. The old test (`pcmNext < now+0.02`) fired while 5-19ms of
+  // audio was still scheduled and jumped the cursor 80ms forward — manufacturing a 61-75ms hole
+  // mid-sentence, repeatedly, in a stream that had not actually run dry.
+  if(pcmNext <= now){
+    pcmUnderruns++;
+    const lead=Math.min(MAX_REBASE_LEAD_MS, TARGET_LATENCY_MS*Math.pow(2,pcmUnderruns-1))/1000;
+    pcmNext=now+lead; fadeIn=true;
+  }
+  const ab=ctx.createBuffer(1, pcmPendingSamples, ctx.sampleRate);
+  const ch=ab.getChannelData(0);
+  let o=0; for(const c of pcmPending){ ch.set(c,o); o+=c.length; }
+  pcmPending=[]; pcmPendingSamples=0;
+  if(fadeIn || pcmNodes.length===0){                 // splice from silence — ramp in
+    const r=Math.min(ch.length, Math.round(ctx.sampleRate*FADE_IN_MS/1000));
+    for(let i=0;i<r;i++) ch[i]*=i/r;
+  }
+  const src=ctx.createBufferSource(); src.buffer=ab; src.connect(pcmGain);
+  const startAt=pcmNext;
+  src.start(startAt);
+  pcmNext+=ab.duration;
   pcmNodes.push(src);
   src.onended=()=>{ const i=pcmNodes.indexOf(src); if(i>=0) pcmNodes.splice(i,1); pcmDone(); };
-  playing=true; setPill('speaking');
-  // DEAD-MAN SWITCH. `playing` gates the microphone, and it is only cleared by onended. Audio is
-  // scheduled ahead of the clock, so if the context is ever interrupted — a phone backgrounding
-  // the tab, the screen locking, an audio-focus change — those callbacks never fire, `playing`
-  // stays true and the mic is gated OFF for the rest of the call with nothing in the UI to say
-  // so. Force the turn closed shortly after the audio was due to finish.
+  // Stop covering for the reply at the moment it is actually AUDIBLE, not when the first bytes
+  // land — with a prebuffer those differ, and killing the ack early leaves a fresh hole.
+  setTimeout(clearFiller, Math.max(0,(startAt-ctx.currentTime)*1000));
+  // DEAD-MAN SWITCH. `playing` gates the microphone and is only cleared by onended. Audio is
+  // scheduled ahead of the clock, so an interrupted context — tab backgrounded, screen locked,
+  // audio focus lost — means those callbacks never fire and the mic stays gated OFF for the rest
+  // of the call with nothing in the UI to say so.
   if(pcmGuard) clearTimeout(pcmGuard);
   pcmGuard=setTimeout(()=>{
     pcmGuard=null;
-    if(!pcmNodes.length) return;
+    if(!pcmNodes.length && !pcmPendingSamples) return;
     pcmStop(); streamDone=true; playing=false; afterPlay();
   }, Math.max(500,(pcmNext-ctx.currentTime)*1000)+2000);
 }
 function pcmStop(){
-  pcmNodes.forEach(n=>{ try{n.stop();}catch(e){} });
-  pcmNodes=[]; pcmNext=0; pcmStreaming=false;
+  // Fade before cutting: stop() at an arbitrary sample amplitude is an audible click on every
+  // barge-in and every guard fire.
+  const nodes=pcmNodes; pcmNodes=[];
+  if(pcmGain && pcmCtx && nodes.length){
+    try{
+      const t=pcmCtx.currentTime;
+      pcmGain.gain.cancelScheduledValues(t);
+      pcmGain.gain.setValueAtTime(pcmGain.gain.value, t);
+      pcmGain.gain.linearRampToValueAtTime(0.0001, t+FADE_OUT_MS/1000);
+    }catch(e){}
+    setTimeout(()=>{
+      nodes.forEach(n=>{ try{n.stop();}catch(e){} });
+      try{ pcmGain.gain.cancelScheduledValues(pcmCtx.currentTime);
+           pcmGain.gain.setValueAtTime(1, pcmCtx.currentTime); }catch(e){}
+    }, FADE_OUT_MS+10);
+  }else{
+    nodes.forEach(n=>{ try{n.stop();}catch(e){} });
+  }
+  pcmNext=0; pcmStreaming=false;
+  pcmPending=[]; pcmPendingSamples=0; pcmStarted=false; pcmFirstArrivalAt=0; pcmUnderruns=0;
+  rsReset();
   if(pcmGuard){ clearTimeout(pcmGuard); pcmGuard=null; }
+  if(pcmHoldTimer){ clearTimeout(pcmHoldTimer); pcmHoldTimer=null; }
 }
 function pcmDone(){
-  if(pcmNodes.length) return;
+  // Audio still held in the prebuffer counts as "not finished" — otherwise a short reply ends the
+  // turn and unmutes the mic while the agent is about to speak, and it hears itself.
+  if(pcmNodes.length || pcmPendingSamples) return;
   if(audioQ.length && !qActive){ drainAudio(); return; }   // a fallback blob queued behind it
   if(streamDone){ playing=false; afterPlay(); }
 }
@@ -1292,7 +1511,7 @@ function playAudio(blob){
   // land while the caller was mid-utterance: no requeue, no retry, the turn was simply lost.
   // Now it's queued and held back; endTurn() releases the queue the moment capture ends.
   // Also held while streamed PCM is still scheduled, so the two paths can never overlap.
-  if(!qActive && !capturing && pcmNodes.length===0) drainAudio();
+  if(!qActive && !capturing && pcmNodes.length===0 && !pcmPendingSamples) drainAudio();
 }
 function drainAudio(){
   if(audioQ.length===0){
@@ -1309,9 +1528,12 @@ function drainAudio(){
 }
 function endOfStream(){
   streamDone=true;
+  // The server has sent everything, so release anything still waiting in the prebuffer — there
+  // will be no further frame to trigger it.
+  if(pcmPendingSamples){ pcmStarted=true; try{ pcmFlush(pcmContext()); }catch(e){} }
   // Streamed PCM is scheduled AHEAD on the audio clock, so "server finished sending" is not
   // "caller finished hearing" — pcmDone() ends the turn when the last frame actually plays out.
-  if(pcmNodes.length) return;
+  if(pcmNodes.length || pcmPendingSamples) return;
   if(!qActive && audioQ.length===0){ playing=false; afterPlay(); }
 }
 function afterPlay(){

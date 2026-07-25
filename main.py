@@ -654,6 +654,12 @@ async def ws_endpoint(ws: WebSocket):
 
             if mtype == "mic_start":
                 state["mic_frames"] = []
+                # The client stamps the language on every mic_start. Previously this frame carried
+                # none, so the transcription language came only from `hello` — and if that was
+                # ever missed or changed, EVERY default in the stack is Hindi, so the caller's
+                # speech was quietly transcribed in the wrong language for the rest of the call.
+                if data.get("lang"):
+                    state["lang"] = data["lang"]
                 # Open Sarvam's socket NOW and transcribe frames as they arrive, so the transcript
                 # is ready the moment the caller stops rather than after a whole-utterance POST.
                 lng0 = norm_lang(state.get("lang", ""), state.get("scenario", "sales"))
@@ -687,6 +693,12 @@ async def ws_endpoint(ws: WebSocket):
                 sstream = state.pop("stt_stream", None)
                 if sstream is not None:
                     await sstream.cancel()
+            elif mtype == "set_lang":
+                # Live language switch from the call header. Deliberately does NOT touch
+                # state["contents"] — the caller can change language mid-conversation and the
+                # agent carries on from what was already said, in the new language.
+                if data.get("lang"):
+                    state["lang"] = data["lang"]
             elif mtype == "hello":
                 if data.get("scenario"):
                     state["scenario"] = data["scenario"]

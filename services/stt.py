@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import struct
 import unicodedata
 
@@ -107,6 +108,9 @@ def _wav(pcm: bytes, sr: int = 16000) -> bytes:
             b"data" + struct.pack("<I", len(pcm)) + pcm)
 
 
+_DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+
+
 def join_segments(parts: list[str]) -> str:
     """Sarvam segments ONE utterance on its own VAD, so a single sentence commonly arrives as
     two or three `data` messages — and consecutive segments sometimes re-recognise a word across
@@ -127,12 +131,13 @@ def join_segments(parts: list[str]) -> str:
                 if [bare(x) for x in out[-k:]] == [bare(x) for x in w[:k]]:
                     w = w[k:]
                     break
-        if out and w:
+        if out and w and _DEVANAGARI.search(out[-1] + w[0]):
             # PARTIAL-word overlap. Sarvam can split a word ACROSS the seam and re-recognise its
             # tail, which produced a real "सफ़ेद" + "फेद कीड़े" -> "सफ़ेद फेद कीड़े" in testing.
-            # Deliberately conservative: only a proper suffix of 3+ characters counts, because
-            # dropping a legitimate short word (Hindi has plenty that tail-match a neighbour)
-            # would be a worse bug than leaving a visible stutter in.
+            # DEVANAGARI ONLY: English is far more suffix-collision-prone, and this rule would
+            # silently delete real words — "price" + "rice per bag" -> "price per bag", likewise
+            # there/here and about/bout. Losing a word is worse than leaving a visible stutter.
+            # Deliberately conservative even here: only a proper suffix of 3+ characters counts.
             a, b = bare(out[-1]), bare(w[0])
             if a != b and len(b) >= 3 and len(a) > len(b) and a.endswith(b):
                 w = w[1:]                   # b is only the tail of a — drop it
