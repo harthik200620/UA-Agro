@@ -86,6 +86,12 @@
     background:radial-gradient(circle at 32% 26%, #6EE8A8, var(--green) 62%, var(--green-deep) 100%);
     animation:dotpulse 1.7s var(--ease) infinite;
     transform:scale(calc(1 + var(--amp) * .4))}
+  /* Live mic level. Without this a caller has no way to tell "the agent is thinking" apart from
+     "the agent cannot hear me at all" — the single most confusing failure in a voice demo. */
+  .meter{display:inline-block;width:70px;height:7px;border-radius:4px;vertical-align:middle;
+    margin-left:10px;background:rgba(20,15,50,.12);overflow:hidden}
+  .meter i{display:block;height:100%;border-radius:4px;
+    width:calc(var(--amp) * 100%);background:var(--green);transition:width .07s linear}
   .dot.busy{
     background:radial-gradient(circle at 32% 26%, #8D97E8, var(--brand) 62%, var(--brand-deep) 100%);
     animation:dotbusy 1s ease-in-out infinite}
@@ -299,6 +305,7 @@
       Mic sensitivity
       <input type="range" id="sens" min="0.006" max="0.04" step="0.002" value="0.016">
       <span id="sensval">normal</span>
+      <span class="meter" title="Live microphone level — this moves when the agent can hear you."><i></i></span>
       <label style="margin-left:14px;cursor:pointer;user-select:none"
              title="Headphones or phone held to your ear: lets you interrupt the agent mid-sentence. Leave OFF on speakerphone — the agent would hear its own voice and cut itself off.">
         <input type="checkbox" id="bargeToggle" style="vertical-align:middle"> 🎧 Interrupt mode
@@ -322,7 +329,14 @@ let typingEl = null;
 let httpMode = false, httpHistory = [];   // HTTP fallback when WebSocket is unavailable (e.g. Vercel)
 let noReplyTimer = null, noReplyCount = 0, endingCall = false, chatActive = false, capabilityNudgeSent = false;
 // No-reply ladder: 3s → follow-up #1, 3s → follow-up #2, 3s → hang up AND record in the CRM.
-const NO_REPLY_MS = 3000, NO_REPLY_CHAT_MS = 8000;
+// 3000 was far too aggressive for a real caller. Someone deciding what to ask next pauses for
+// 2-5s routinely, so the agent talked over them — and because onPcm gates on `playing`, whatever
+// they said DURING that nudge was discarded outright. Four steps at 3s also meant ~12s of
+// thinking silence hung the call up on them. A nudge is for someone who has actually gone away.
+const NO_REPLY_MS = 10000, NO_REPLY_CHAT_MS = 20000;
+// Heard any voice this recently and the caller is plainly still there — re-arm, never nudge.
+const VOICE_GRACE_MS = 4000;
+let lastVoiceAt = 0;
 // ── Two axes: scenario (persona/tool) × language (what the agent speaks) ──
 let sessionScenario = 'sales', sessionLang = 'hindi';
 const LANGS = {
@@ -721,6 +735,8 @@ async function handleNoReply(){
   noReplyTimer=null;
   if(!sessionActive() || endingCall) return;
   if(waitingForServer || playing || capturing){ armNoReply(); return; }   // busy/speaking — recheck
+  // Someone mid-sentence, or speaking too quietly to have tripped capture, is NOT silent.
+  if(performance.now() - lastVoiceAt < VOICE_GRACE_MS){ armNoReply(); return; }
   if(noReplyCount < 2){ triggerReask(); }                                 // two follow-ups
   else if(!closeRequested){ closeRequested=true; sendSilent(closeNote()); }
   else { endingCall=true; sayFixed(endingLine()); }   // afterPlay ends the call after it's spoken
@@ -934,6 +950,7 @@ let capturing=false, speechFrames=[], preRoll=[], silentSamples=0, speechSamples
 // DOM reads and layout-invalidating style writes on the thread that also runs the VAD and
 // schedules playback.
 let sensVal=parseFloat(($('sens')||{}).value)||0.02, _ampVal=0, _ampRaf=0, micFrames=0;
+let noiseFloor=0.004;
 function setAmp(v){
   _ampVal=v;
   if(_ampRaf) return;
@@ -972,12 +989,20 @@ async function startMic(){
   // error anywhere. That is precisely what "it isn't taking my voice" looks like on a phone.
   try{ if(audioCtx.state==='suspended') await audioCtx.resume(); }catch(e){}
   srate = audioCtx.sampleRate;
-  await audioCtx.audioWorklet.addModule('/static/pcm-worklet.js');
-  sourceNode = audioCtx.createMediaStreamSource(micStream);
-  workletNode = new AudioWorkletNode(audioCtx,'pcm-processor');
-  workletNode.port.onmessage = e => onPcm(e.data);
-  sourceNode.connect(workletNode);
-  workletNode.connect(audioCtx.destination);
+  // Everything below was UNGUARDED: if the worklet module failed to fetch or compile, startMic()
+  // rejected, which rejected startTalking() — leaving the call half-started, the mic dead and
+  // not one word anywhere explaining why.
+  try{
+    await audioCtx.audioWorklet.addModule('/static/pcm-worklet.js');
+    sourceNode = audioCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioCtx,'pcm-processor');
+    workletNode.port.onmessage = e => onPcm(e.data);
+    sourceNode.connect(workletNode);
+    workletNode.connect(audioCtx.destination);
+  }catch(e){
+    sysNote('🎤 Couldn\'t start the microphone on this browser — you can still type below.');
+    return;
+  }
   // Watchdog: if not a single audio frame arrives, the mic is dead. Try once more to resume,
   // then SAY so — a silent dead mic is the worst possible failure in a live demo.
   micFrames = 0;
@@ -1072,8 +1097,17 @@ function onPcm(chunk){
   let sum=0; for(let i=0;i<n;i++){ const s=chunk[i]; sum+=s*s; }
   const rms=Math.sqrt(sum/n);
   setAmp(Math.min(1, rms/0.05));
-  const startT=sensVal;
+  // ADAPTIVE THRESHOLD. A single absolute number cannot serve a laptop mic, a phone held at
+  // arm's length and a noisy shop counter alike — and when the caller's mic simply runs quieter
+  // than the fixed 0.016, capture NEVER triggers and the agent appears deaf with no clue why.
+  // Track the quiet level and trigger on a clear rise above it, capped by the slider so the
+  // effective threshold is only ever MORE sensitive than what the user asked for, never less.
+  if(!capturing){
+    noiseFloor = rms < noiseFloor ? (noiseFloor*0.9 + rms*0.1) : (noiseFloor*0.995 + rms*0.005);
+  }
+  const startT=Math.min(sensVal, Math.max(0.006, noiseFloor*4));
   const silT=startT*0.6;
+  if(rms>startT) lastVoiceAt=performance.now();   // proof the caller is still there
   const preMax=srate*PREROLL_MS/1000;
 
   if(!capturing){
@@ -1200,7 +1234,7 @@ let audioQ=[], qActive=false, streamDone=false, audioEpoch=0;
 // leaves an audible 30-120ms hole between chunks — and, crucially, can't start until a whole
 // self-contained audio file has arrived. This path starts on the FIRST frame. Used whenever the
 // server announces streaming:true; the blob queue stays for the opener and the HTTP fallback.
-let pcmStreaming=false, pcmRate=24000, pcmNext=0, pcmCtx=null, pcmNodes=[];
+let pcmStreaming=false, pcmRate=24000, pcmNext=0, pcmCtx=null, pcmNodes=[], pcmGuard=null;
 function pcmContext(){
   if(!pcmCtx || pcmCtx.state==='closed'){ pcmCtx=new (window.AudioContext||window.webkitAudioContext)(); }
   if(pcmCtx.state==='suspended'){ try{ pcmCtx.resume(); }catch(e){} }
@@ -1225,10 +1259,22 @@ function pcmPush(buf){
   pcmNodes.push(src);
   src.onended=()=>{ const i=pcmNodes.indexOf(src); if(i>=0) pcmNodes.splice(i,1); pcmDone(); };
   playing=true; setPill('speaking');
+  // DEAD-MAN SWITCH. `playing` gates the microphone, and it is only cleared by onended. Audio is
+  // scheduled ahead of the clock, so if the context is ever interrupted — a phone backgrounding
+  // the tab, the screen locking, an audio-focus change — those callbacks never fire, `playing`
+  // stays true and the mic is gated OFF for the rest of the call with nothing in the UI to say
+  // so. Force the turn closed shortly after the audio was due to finish.
+  if(pcmGuard) clearTimeout(pcmGuard);
+  pcmGuard=setTimeout(()=>{
+    pcmGuard=null;
+    if(!pcmNodes.length) return;
+    pcmStop(); streamDone=true; playing=false; afterPlay();
+  }, Math.max(500,(pcmNext-ctx.currentTime)*1000)+2000);
 }
 function pcmStop(){
   pcmNodes.forEach(n=>{ try{n.stop();}catch(e){} });
   pcmNodes=[]; pcmNext=0; pcmStreaming=false;
+  if(pcmGuard){ clearTimeout(pcmGuard); pcmGuard=null; }
 }
 function pcmDone(){
   if(pcmNodes.length) return;
