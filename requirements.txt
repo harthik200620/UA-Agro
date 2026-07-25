@@ -1,5 +1,7 @@
 fastapi
 uvicorn[standard]
 httpx
+h2
+websockets
 python-dotenv
 python-multipart

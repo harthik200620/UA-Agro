@@ -12,6 +12,7 @@ until the lookup runs, so it gets a genuine second turn instead (see _QUERY_TOOL
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -430,13 +431,314 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
     raise RuntimeError("All Gemini keys exhausted — " + (last_err or "quota/invalid"))
 
 
+# ── STREAMING PATH ────────────────────────────────────────────────────────────────────────
+# The single biggest latency win in the whole pipeline. With :generateContent nothing exists
+# until the WHOLE reply has been written (measured 1.3-1.9s here) and only then can TTS start.
+# With :streamGenerateContent the FIRST CLAUSE is typically ready in 350-550ms and goes
+# straight to the synthesiser while the rest is still being generated. STREAM_LLM=0 restores
+# the old blocking path exactly.
+_URL_STREAM = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               "{model}:streamGenerateContent")
+STREAM_LLM = _clean("STREAM_LLM", "1").lower() not in ("0", "false", "no", "off")
+
+# No FIRST TOKEN within this long means the primary key is stalling — fire a backup and race.
+# This supersedes the whole-response hedge timer on the streaming path: a stall is visible at
+# the first token, so we no longer wait 3.5s of total silence to notice one. Same anti-burst
+# property as the staggered hedge (the backup only ever fires on a real stall).
+# 2500 is MEASURED, not guessed: healthy TTFT on this pool is ~1.25s (and it is fixed overhead —
+# a one-word reply costs the same as a full sentence), so the first value tried here, 1200ms,
+# fired the backup on EVERY turn. That doubled quota burn for nothing and fed the 429 pressure
+# that causes the tail stalls the hedge exists to cover in the first place.
+_TTFT_STALL_MS = max(250, _int_env("GEMINI_TTFT_STALL_MS", 2500))
+# Most streams a single turn may have IN FLIGHT at once. MEASURED constraint: a free-tier key
+# serves ~7 requests per MINUTE (verified — the 8th returns 429 whether it carries 10 tokens or
+# 4,500). Every extra racer therefore spends another key's minute-budget, which is the same
+# reason simultaneous hedging was measured harmful on this pool once before. 2 = one backup.
+_MAX_RACE = max(1, _int_env("GEMINI_MAX_RACE", 2))
+# …and the hard cap on how many keys ONE turn may consume in total. Without this the failure
+# path walked the whole 104-key pool inside its 7s budget, spending ~30 keys' minute-quota on a
+# single turn and guaranteeing the next turn failed too — a transient shortage turning itself
+# into a pool-wide outage. Give up gracefully after a handful instead; the pool stays healthy.
+_MAX_KEYS_PER_TURN = max(2, _int_env("GEMINI_MAX_KEYS_PER_TURN", 6))
+# Hard ceiling on "no first token from ANY key". Without it, a turn where every raced stream
+# stalls waits out the httpx read timeout once per rotation — measured 24s of pure silence on a
+# quota-stressed pool, which is a dead call. At the ceiling we stop and let gemini_turn speak its
+# graceful "say that again?" line instead: bad, but an order of magnitude less bad than silence.
+_TTFT_GIVEUP_MS = max(2000, _int_env("GEMINI_TTFT_GIVEUP_MS", 7000))
+_DEBUG = _clean("GEMINI_DEBUG", "0").lower() not in ("0", "false", "no", "off", "")
+# TRIED AND REMOVED (2026-07-25): a "last resort" pass that re-asked an emergency model
+# (gemini-flash-lite-latest) on untouched keys once every key had failed on the real one. The
+# idea was sound — lite was verified serving 200 on 12/12 keys while the primary 503'd — but
+# MEASURED WORSE end to end: it appends up to three more sequential calls to the failure path,
+# and turns that used to fail fast with a graceful line instead produced NO reply at all inside
+# 40s. Failing fast and saying "sorry, the line broke" beats an unbounded rescue attempt.
+
+_CLAUSE_HARD, _CLAUSE_SOFT = "।?!.…\n", ",;:—"
+_CLAUSE_MIN, _CLAUSE_SOFT_MIN, _CLAUSE_MAX = 12, 40, 90
+
+
+def _speakable(s: str) -> str:
+    """The same sanitisation gemini_turn applies to the final text, applied per clause — so
+    what gets spoken early is always a prefix of what the turn ultimately returns."""
+    s = re.sub(r"\(System[^)]*\)?", "", s or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _next_clause(buf: str) -> tuple[str, str]:
+    """Peel one speakable clause off a growing buffer -> (clause, remainder)."""
+    if len(buf) < _CLAUSE_MIN:
+        return "", buf
+    # Never emit a half-written "(System …)" leak: gemini_turn strips those from the final text,
+    # so a partial one must not reach the speaker either.
+    sys_at = buf.rfind("(System")
+    if sys_at >= 0 and ")" not in buf[sys_at:]:
+        return "", buf
+    for i, ch in enumerate(buf):
+        if i + 1 < _CLAUSE_MIN:
+            continue
+        if ch in _CLAUSE_HARD:
+            # "2.5 लीटर" and "₹1,200" must not be mistaken for a sentence end.
+            if ch == "." and (buf[i - 1:i].isdigit() or buf[i + 1:i + 2].isdigit()):
+                continue
+            return buf[:i + 1], buf[i + 1:]
+        if ch in _CLAUSE_SOFT and i + 1 >= _CLAUSE_SOFT_MIN:
+            return buf[:i + 1], buf[i + 1:]
+    if len(buf) >= _CLAUSE_MAX:                    # no punctuation in sight — break on a word
+        cut = buf.rfind(" ", _CLAUSE_MIN, _CLAUSE_MAX)
+        if cut > 0:
+            return buf[:cut + 1], buf[cut + 1:]
+    return "", buf
+
+
+def norm_spoken(s: str) -> str:
+    """Public alias — main.py uses it to compare what was already streamed to the speaker
+    against the turn's final text, so it can synthesise only the remainder."""
+    return _speakable(s)
+
+
+def _parts_of(data: dict) -> list:
+    cands = data.get("candidates") or []
+    return ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+
+
+async def _sse_pump(key_idx: int, model: str, body: dict, out: asyncio.Queue, tag: int) -> None:
+    """Run ONE streaming request, pushing (tag, kind, status, payload) onto a shared queue.
+    'done' is pushed only after the response is fully closed, so a finished pump is safe to
+    cancel without leaving a half-read connection in the keep-alive pool."""
+    finished = False
+    try:
+        async with _http.client().stream(
+            "POST", _URL_STREAM.format(model=model),
+            params={"key": _KEYS[key_idx], "alt": "sse"}, json=body,
+        ) as resp:
+            if resp.status_code >= 400:
+                detail = (await resp.aread()).decode("utf-8", "replace")
+                await out.put((tag, "err", resp.status_code, detail[:200]))
+                return
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                try:
+                    await out.put((tag, "chunk", 0, json.loads(raw)))
+                except json.JSONDecodeError:
+                    continue
+            finished = True
+        if finished:
+            await out.put((tag, "done", 0, None))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await out.put((tag, "err", 0, str(exc)[:200]))
+
+
+async def _generate_stream(contents: list, scenario: str = "lead", lang: str = "",
+                           force_tool: bool = False, on_clause=None) -> dict:
+    """Streaming twin of _generate(): same inputs, and deliberately the SAME return shape.
+
+    The only difference is that complete clauses are handed to `on_clause` the moment they are
+    ready, instead of the caller waiting for the whole reply. Returning an identical
+    {"candidates":[{"content":{"parts":[…]}}]} dict is the point — gemini_turn's tool dispatch,
+    required-field gate, anonymous-caller blanking and sanitisation all keep working unchanged.
+    """
+    global _fresh_idx, last_attempt_count, last_served_by
+    if not _KEYS:
+        raise RuntimeError("No Gemini API key set")
+    system_text = build_system_prompt(_today(), scenario, lang)
+    tools = [{"functionDeclarations": tools_for(scenario)}]
+    tool_config = {"functionCallingConfig": {"mode": "ANY" if force_tool else "AUTO"}}
+    last_attempt_count = 0
+    last_served_by = ""
+    last_err = None
+    all_cooling = all(_cooldown.get(i, 0) > time.time() for i in range(len(_KEYS)))
+
+    def _body_for(key_idx: int) -> tuple[str, dict]:
+        model = _model_for_key_idx(key_idx)
+        gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
+        thinking = _thinking_config_for(model)
+        if thinking:
+            gen_config["thinkingConfig"] = thinking
+        return model, {
+            "systemInstruction": {"parts": [{"text": system_text}]},
+            "contents": contents,
+            "tools": tools,
+            "toolConfig": tool_config,
+            "generationConfig": gen_config,
+        }
+
+    # Fresh tier first, reserve tier second, cooling keys last — a cooldown cascade must degrade
+    # to "try anyway", never to a failed turn (the same rule _generate's two-pass walk enforces).
+    hot, cold = [], []
+    for tier in (_FRESH_ORDER, _OTHER_ORDER):
+        for k in tier:
+            (cold if (not all_cooling and _cooldown.get(k, 0) > time.time()) else hot).append(k)
+    if hot:                                   # rotate so traffic spreads across the fresh tier
+        _fresh_idx = (_fresh_idx + 1) % len(hot)
+        hot = hot[_fresh_idx:] + hot[:_fresh_idx]
+    order = (hot + cold) or list(range(len(_KEYS)))
+
+    turn_deadline = time.monotonic() + _TTFT_GIVEUP_MS / 1000
+    for attempt, primary in enumerate(order):
+        if time.monotonic() >= turn_deadline or last_attempt_count >= _MAX_KEYS_PER_TURN:
+            break
+        q: asyncio.Queue = asyncio.Queue()
+        tasks: dict[int, asyncio.Task] = {}
+        meta: dict[int, tuple[int, str]] = {}
+        winner = None
+
+        def _launch(key_idx: int, tag: int) -> None:
+            model, body = _body_for(key_idx)
+            meta[tag] = (key_idx, model)
+            tasks[tag] = asyncio.ensure_future(_sse_pump(key_idx, model, body, q, tag))
+
+        try:
+            _launch(primary, 0)
+            last_attempt_count += 1
+            first_chunk, fired = None, 1
+            next_deadline = time.monotonic() + _TTFT_STALL_MS / 1000
+            while tasks and winner is None:
+                # ESCALATING stagger. Firing exactly one backup wasn't enough: measured stalls of
+                # 6s and 11s happened with the backup already in flight and also stalling. Each
+                # further _TTFT_STALL_MS of total silence adds one more key, up to _MAX_RACE.
+                # Still nothing like simultaneous racing — on a healthy turn (~1.4s TTFT) not one
+                # extra request is ever sent, so the burst rate that 429s this pool is unchanged.
+                more = order[attempt + fired] if attempt + fired < len(order) else None
+                budget = turn_deadline - time.monotonic()
+                if budget <= 0:
+                    break
+                can_escalate = (more is not None and fired < _MAX_RACE
+                                and last_attempt_count < _MAX_KEYS_PER_TURN)
+                wait_s = max(0.01, min(next_deadline - time.monotonic(), budget)
+                             if can_escalate else budget)
+                try:
+                    tag, kind, status, payload = await asyncio.wait_for(q.get(), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    if not can_escalate or time.monotonic() >= turn_deadline:
+                        if _DEBUG:
+                            print(f"  [gem] gave up: tried keys "
+                                  f"{[m[0] + 1 for m in meta.values()]}", flush=True)
+                        break                       # out of budget — stop waiting on this turn
+                    if _DEBUG:
+                        print(f"  [gem] key{meta[fired - 1][0] + 1} silent >"
+                              f"{_TTFT_STALL_MS}ms — escalating to key{more + 1}", flush=True)
+                    _launch(more, fired)
+                    fired += 1
+                    last_attempt_count += 1
+                    next_deadline = time.monotonic() + _TTFT_STALL_MS / 1000
+                    continue
+                if kind == "chunk":
+                    winner, first_chunk = tag, payload
+                    break
+                k, m = meta[tag]
+                if kind == "err":
+                    last_err = f"Gemini {status or ''} (key {k + 1}, {m}): {payload}"
+                    if _DEBUG:
+                        print(f"  [gem] key{k + 1} {m} ERR {status} {str(payload)[:110]}",
+                              flush=True)
+                    if _should_rotate(status, payload or ""):
+                        _cooldown[k] = time.time() + (60 if status == 429 else 15)
+                elif _DEBUG:
+                    print(f"  [gem] key{k + 1} {m} stream ended with no content", flush=True)
+                tasks.pop(tag, None)
+            if winner is None:
+                continue                        # nothing came back on this key — try the next
+            for tag, t in tasks.items():
+                if tag != winner and not t.done():
+                    t.cancel()
+            key_idx, model = meta[winner]
+            _cooldown.pop(key_idx, None)
+            last_served_by = f"key{key_idx + 1}/{model}" + ("~backup" if winner else "")
+
+            full_text, held, extra_parts, saw_tool = "", "", [], False
+            chunk = first_chunk
+            while True:
+                for part in _parts_of(chunk):
+                    piece = part.get("text")
+                    if isinstance(piece, str):
+                        full_text += piece
+                        held += piece
+                    elif part:
+                        extra_parts.append(part)   # functionCall (+ thoughtSignature) kept whole
+                        saw_tool = True
+                # Stop speaking the moment a tool call appears: what is said after one is decided
+                # by gemini_turn (its own text, a fallback line, a re-ask, or a second turn) —
+                # never by this stream.
+                if on_clause and not saw_tool:
+                    while True:
+                        clause, held = _next_clause(held)
+                        if not clause:
+                            break
+                        say = _speakable(clause)
+                        if say:
+                            await on_clause(say)
+                nxt = None
+                while True:                        # next event from the winning stream only
+                    tag, kind, status, payload = await q.get()
+                    if tag != winner:
+                        continue                   # a cancelled loser's straggler — ignore
+                    if kind == "chunk":
+                        nxt = payload
+                    elif kind == "err":
+                        last_err = f"Gemini stream cut (key {key_idx + 1}): {payload}"
+                    break
+                if nxt is None:
+                    break
+                chunk = nxt
+            if on_clause and not saw_tool:
+                say = _speakable(held)             # flush the tail
+                if say:
+                    await on_clause(say)
+
+            parts = ([{"text": full_text}] if full_text else []) + extra_parts
+            return {"candidates": [{"content": {"parts": parts or [{"text": ""}]}}]}
+        finally:
+            for t in tasks.values():
+                if not t.done():
+                    t.cancel()
+            # A key that never produced a first token is stalling, even though it never returned
+            # a status we'd rotate on. Cool it off too, or the next turn picks the same throttled
+            # keys straight away — measured: four consecutive turns all timing out on keys 81-85
+            # while the other 99 keys in the pool sat idle and healthy.
+            for tag, (k, _m) in meta.items():
+                if tag != winner:
+                    _cooldown[k] = max(_cooldown.get(k, 0), time.time() + 20)
+
+    raise RuntimeError("All Gemini keys exhausted (stream) — " + (last_err or "quota/invalid"))
+
+
 async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: str = "sales",
-                      lang: str = "") -> str:
+                      lang: str = "", on_clause=None) -> str:
     """Run one customer turn.
 
     handlers: {tool_name: async fn(args)->result_dict}. Returns the agent's reply text.
     `scenario` (sales/gosthi) selects the persona and tool set; `lang` (english/hindi) selects
     the spoken language — empty falls back to the scenario's showcase default.
+    `on_clause`: optional async fn(str) called with each speakable clause AS IT IS GENERATED.
+    Passing it switches this turn to :streamGenerateContent; leaving it None keeps the original
+    blocking path byte-for-byte. What it receives is always a prefix of the returned text (see
+    _speakable), so the caller can synthesise the remainder and never repeat itself.
     """
     lang = norm_lang(lang, scenario)
     contents.append({"role": "user", "parts": [{"text": user_text}]})
@@ -447,11 +749,19 @@ async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: 
 
     for turn_i in range(5):  # allow a couple of tool round-trips
         try:
-            # Hedge only the first call of the turn — tool-followup calls are rare and the
-            # racing setup isn't worth doubling their quota cost.
-            data = await _generate(contents, scenario, lang,
-                                   force_tool=force_tool and last_tool is None,
-                                   hedge=turn_i == 0)
+            if on_clause is not None and STREAM_LLM:
+                # Streaming: clauses reach the synthesiser as they are written. EVERY turn
+                # streams, the find_nearest_fap follow-up included — that second call is a full
+                # Gemini round-trip the caller would otherwise sit through in silence.
+                data = await _generate_stream(contents, scenario, lang,
+                                              force_tool=force_tool and last_tool is None,
+                                              on_clause=on_clause)
+            else:
+                # Hedge only the first call of the turn — tool-followup calls are rare and the
+                # racing setup isn't worth doubling their quota cost.
+                data = await _generate(contents, scenario, lang,
+                                       force_tool=force_tool and last_tool is None,
+                                       hedge=turn_i == 0)
         except Exception:
             # If a tool already saved this turn, give a graceful spoken confirmation instead
             # of surfacing a raw error (e.g. when the follow-up call hits a Gemini 429).

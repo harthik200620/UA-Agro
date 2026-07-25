@@ -13,10 +13,16 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import base64
 import asyncio
 
 import httpx
+
+try:
+    import websockets                     # ships with uvicorn[standard]; pinned in requirements
+except Exception:                         # absent → streaming TTS is simply unavailable and
+    websockets = None                     # every reply falls back to the blocking HTTP synth
 
 from . import _http
 
@@ -156,6 +162,7 @@ _eleven_reason: str = "not probed"
 # Voices this key can't speak (402 paid_plan_required on library voices, 404 voice_not_found).
 # Tracked PER VOICE — one dead voice must never silence the languages whose voices work.
 _dead_voices: set[str] = set()
+_probe_started = False
 _probe_fails = 0  # consecutive probe exceptions (see probe_elevenlabs)
 
 
@@ -302,11 +309,16 @@ async def synthesize(text: str, lang: str = "english") -> tuple[bytes | None, st
     if not text or TTS_PROVIDER == "none":
         return None, None
 
+    global _probe_started
     lng = (lang or "").lower()
 
-    # Lazy probe (serverless cold start may not have run the startup hook).
-    if _eleven_ok is None:
-        await probe_elevenlabs()
+    # The lazy probe used to run HERE and be AWAITED, putting a whole GET /v1/models round-trip
+    # in front of the first synth on every cold serverless instance. Optimism is cheaper and
+    # just as correct: attempt ElevenLabs unless a previous call PROVED it dead, and let the
+    # probe run in the background purely so /config reports the truth.
+    if _eleven_ok is None and not _probe_started:
+        _probe_started = True
+        asyncio.ensure_future(probe_elevenlabs())
 
     # Telugu: prefer Sarvam Bulbul — faster than the slow eleven_v3 and native to the language
     # (also reads numbers/dates more cleanly). Only when a Sarvam key exists; else fall through
@@ -320,7 +332,7 @@ async def synthesize(text: str, lang: str = "english") -> tuple[bytes | None, st
             pass  # fall through to ElevenLabs v3
 
     # Preferred: ElevenLabs (if probe said it's usable and this language's voice isn't dead)
-    if TTS_PROVIDER == "elevenlabs" and _eleven_ok and _voice_for(lng) not in _dead_voices:
+    if TTS_PROVIDER == "elevenlabs" and _eleven_ok is not False and _voice_for(lng) not in _dead_voices:
         try:
             audio, mime = await _elevenlabs(text, lang)
             if audio:
@@ -333,3 +345,173 @@ async def synthesize(text: str, lang: str = "english") -> tuple[bytes | None, st
         return await _sarvam(text, lang)
     except Exception:
         return None, None
+
+
+# ── STREAMING TTS (ElevenLabs stream-input WebSocket) ──────────────────────────────────────
+# The blocking endpoint above can't start until the whole reply text exists, then buffers the
+# entire MP3 before returning a single byte. This socket is built for the opposite: text goes in
+# clause by clause as Gemini writes it, and audio comes back while the model is still
+# generating. Published time-to-first-byte for Flash over this socket in South Asia is
+# 150-200ms. STREAM_TTS=0 disables it and every reply goes back through synthesize().
+STREAM_TTS = _clean("STREAM_TTS", "1").lower() not in ("0", "false", "no", "off")
+# Raw PCM here: no client-side decode AT ALL. An <audio> element's load+decode cycle cost
+# 20-100ms on the first chunk plus an audible 30-120ms gap between chunks; PCM fed straight into
+# a Web Audio buffer queue has neither. 24kHz keeps the timbre close to the mp3_22050_32 the
+# blocking path uses. Override with ELEVENLABS_STREAM_FORMAT (e.g. pcm_16000 on a thin link).
+_STREAM_FORMAT = _clean("ELEVENLABS_STREAM_FORMAT", "pcm_24000")
+# auto_mode is deliberately OFF: it replaces the chunk schedule with a sentence tokenizer, i.e.
+# it waits for a complete sentence before synthesising anything. A low first value in
+# chunk_length_schedule starts generation after ~50 characters instead, and the first clause is
+# additionally force-started with flush (see feed()).
+_STREAM_URL = ("wss://api.elevenlabs.io/v1/text-to-speech/{voice}/stream-input"
+               "?model_id={model}&output_format={fmt}&inactivity_timeout=20")
+_CHUNK_SCHEDULE = [50, 160, 250, 290]
+
+
+def stream_sample_rate() -> int:
+    """Sample rate of the streaming format, or 0 when it isn't raw PCM (mp3/opus/ulaw)."""
+    m = re.match(r"pcm_(\d+)$", _STREAM_FORMAT)
+    return int(m.group(1)) if m else 0
+
+
+class ElevenStream:
+    """One ElevenLabs stream-input socket, alive for a single reply.
+
+    start() (non-blocking) → feed(clause) per clause → finish(); audio is consumed concurrently
+    via chunks(). `ok` goes False the moment anything fails and `spoken` records exactly what was
+    successfully sent — together they let the caller synthesise whatever was NOT delivered
+    through the blocking path, without ever repeating a line the caller already heard.
+    """
+
+    def __init__(self, lang: str = "english"):
+        self.lang = (lang or "english").lower()
+        self.ok = False
+        self.spoken = ""
+        self.got_audio = False
+        self.sample_rate = stream_sample_rate()
+        self.mime = "audio/pcm" if self.sample_rate else "audio/mpeg"
+        self._ws = None
+        self._opening: asyncio.Task | None = None
+        self._reader: asyncio.Task | None = None
+        self._audio: asyncio.Queue = asyncio.Queue()
+
+    def usable(self) -> bool:
+        return bool(STREAM_TTS and websockets and (_ELEVEN_KEYS or ELEVEN_KEY)
+                    and TTS_PROVIDER == "elevenlabs" and _eleven_ok is not False
+                    and _voice_for(self.lang) not in _dead_voices)
+
+    def start(self) -> None:
+        """Begin the handshake WITHOUT blocking, so it overlaps the LLM's time-to-first-token
+        rather than adding to it — by the time the first clause exists the socket is already up."""
+        if self.usable() and self._opening is None:
+            self._opening = asyncio.ensure_future(self._open())
+
+    async def _open(self) -> None:
+        url = _STREAM_URL.format(voice=_voice_for(self.lang), model=_model_for(self.lang),
+                                 fmt=_STREAM_FORMAT)
+        try:
+            self._ws = await asyncio.wait_for(websockets.connect(url, max_size=None), timeout=6)
+            # Auth rides in the init frame, not a header — avoids the extra_headers /
+            # additional_headers rename between websockets versions entirely.
+            await self._ws.send(json.dumps({
+                "text": " ",
+                "voice_settings": _voice_settings_for(self.lang),
+                "generation_config": {"chunk_length_schedule": _CHUNK_SCHEDULE},
+                "xi_api_key": _ELEVEN_KEYS[_eleven_key_idx] if _ELEVEN_KEYS else ELEVEN_KEY,
+            }))
+        except Exception:
+            self._ws = None
+            return
+        self._reader = asyncio.ensure_future(self._read())
+        self.ok = True
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                b64 = msg.get("audio")
+                if b64:
+                    self.got_audio = True
+                    await self._audio.put(base64.b64decode(b64))
+                if msg.get("isFinal"):
+                    break
+        except Exception:
+            pass
+        finally:
+            self._audio.put_nowait(None)          # sentinel — no more audio for this reply
+
+    async def _ready(self) -> None:
+        task = self._opening
+        if task is not None:
+            try:
+                await task
+            except Exception:
+                pass
+            if self._opening is task:
+                self._opening = None
+
+    async def feed(self, text: str) -> None:
+        """Send one clause. Passed straight to gemini_turn(on_clause=…)."""
+        await self._ready()
+        t = _fix_pronunciation(_strip_audio_tags((text or "").strip()))
+        if not (self.ok and self._ws and t):
+            return
+        payload = {"text": t + " "}
+        if not self.spoken:
+            # Force the FIRST clause into generation immediately rather than waiting for the
+            # chunk schedule to fill — this is the difference between the caller hearing the
+            # reply start and the caller hearing silence while the buffer fills.
+            payload["flush"] = True
+        try:
+            await self._ws.send(json.dumps(payload))
+            self.spoken = (self.spoken + " " + t).strip()
+        except Exception:
+            self.ok = False
+
+    async def finish(self) -> None:
+        """Close the text side and drain the audio the model is still producing."""
+        await self._ready()
+        if self._ws and self.ok:
+            try:
+                await self._ws.send(json.dumps({"text": ""}))
+            except Exception:
+                self.ok = False
+        if self._reader is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._reader), timeout=25)
+            except Exception:
+                self._reader.cancel()
+                self._audio.put_nowait(None)
+        else:
+            self._audio.put_nowait(None)
+        await self._shut()
+
+    async def cancel(self) -> None:
+        """Abandon this reply mid-flight (barge-in, or a diverged final line)."""
+        self.ok = False
+        if self._reader is not None and not self._reader.done():
+            self._reader.cancel()
+        await self._shut()
+        self._audio.put_nowait(None)
+
+    async def _shut(self) -> None:
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def chunks(self):
+        """Async-iterate audio as it arrives; ends when the reply completes or is cancelled."""
+        await self._ready()
+        if not self.ok:
+            return
+        while True:
+            item = await self._audio.get()
+            if item is None:
+                return
+            yield item

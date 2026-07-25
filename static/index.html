@@ -299,6 +299,10 @@
       Mic sensitivity
       <input type="range" id="sens" min="0.006" max="0.04" step="0.002" value="0.016">
       <span id="sensval">normal</span>
+      <label style="margin-left:14px;cursor:pointer;user-select:none"
+             title="Headphones or phone held to your ear: lets you interrupt the agent mid-sentence. Leave OFF on speakerphone — the agent would hear its own voice and cut itself off.">
+        <input type="checkbox" id="bargeToggle" style="vertical-align:middle"> 🎧 Interrupt mode
+      </label>
     </div>
     <div class="typer">
       <input id="typebox" placeholder="…or type instead of speaking" />
@@ -415,6 +419,18 @@ function chooseScenario(s, l){
   if(recog){ try{ recog.lang = langCode(); }catch(e){} }
   getOpening();   // prefetch the opener audio NOW — the call picks up instantly on Start
   init();
+  warmUp();
+}
+
+// Pay the connection costs while the caller is still reading the scenario card. The WS handshake
+// (TCP + TLS + HTTP upgrade) and the AudioWorklet module fetch both used to land on the
+// "Answer call" click, where they are pure dead air on the critical path.
+function warmUp(){
+  try{ ensureWS(); }catch(e){}                                       // fire and forget
+  try{ fetch('/static/pcm-worklet.js',{cache:'force-cache'}).catch(()=>{}); }catch(e){}
+  // Acks AFTER the opener, never alongside it: the ElevenLabs free tier allows 2 concurrent
+  // synths and this project has already had real 429 storms from stacking them at pickup.
+  try{ getOpening().then(loadAcks).catch(()=>{}); }catch(e){}
 }
 
 async function init(){
@@ -444,12 +460,46 @@ async function getOpening(){
       openerData = await (await fetch('/api/opening',{method:'POST',body:fd})).json();
     }catch(e){ openerData=null; }
     openerPromise=null;
-    return openerPromise;
+    return openerData;   // was `return openerPromise` — nulled one line earlier, so every
+                         // `await getOpening()` resolved null and the prefetched bytes went unused
   })();
   return openerPromise;
 }
 
-function scheduleFiller(){}
+// ── Instant acknowledgement ──────────────────────────────────────────────────
+// ~1.25s of every reply is Gemini's fixed time-to-first-token — measured on this key pool, and
+// immovable at this quality tier (a one-word reply costs exactly as long as a full sentence).
+// So cover it rather than pretend it isn't there: a short pre-cached "जी…" lands ~260ms after the
+// caller stops speaking, the way a person says "mm-hm" while they think. Cancelled the moment the
+// real reply starts and never repeated back to back, so it stays a backchannel, not a tic.
+const ACK_DELAY_MS = 260;
+let ackClips=[], ackTimer=null, ackLast=-1, ackAudio=null;
+async function loadAcks(){
+  try{
+    const fd=new FormData(); fd.append('password',adminPw);
+    fd.append('scenario',sessionScenario); fd.append('lang',sessionLang);
+    const j=await (await fetch('/api/acks',{method:'POST',body:fd})).json();
+    ackClips=(j.acks||[]).filter(a=>a.audio_b64)
+                         .map(a=>URL.createObjectURL(b64toBlob(a.audio_b64,a.mime)));
+  }catch(e){ ackClips=[]; }
+}
+function scheduleFiller(){
+  clearFiller();
+  if(!ackClips.length) return;
+  ackTimer=setTimeout(()=>{
+    ackTimer=null;
+    // Skip entirely when the turn was already fast — nothing to cover.
+    if(playing || !waitingForServer || !listening || endingCall) return;
+    let i=Math.floor(Math.random()*ackClips.length);
+    if(ackClips.length>1 && i===ackLast) i=(i+1)%ackClips.length;
+    ackLast=i;
+    try{ ackAudio=new Audio(ackClips[i]); ackAudio.play().catch(()=>{}); }catch(e){}
+  }, ACK_DELAY_MS);
+}
+function clearFiller(){
+  if(ackTimer){ clearTimeout(ackTimer); ackTimer=null; }
+  if(ackAudio){ try{ ackAudio.pause(); }catch(e){} ackAudio=null; }
+}
 
 function renderCfg(){
   const c = CONFIG;
@@ -733,6 +783,10 @@ async function sayRest(text){
 
 function onWsMessage(ev){
   if(typeof ev.data !== 'string'){
+    // The caller interrupted: the server is still finishing the abandoned reply, so drop its
+    // remaining audio rather than playing it over them.
+    if(dropAudioUntilIdle){ return; }
+    if(pcmStreaming){ pcmPush(ev.data); return; }
     const blob = new Blob([ev.data], {type: pendingAudioMime||'audio/mpeg'});
     pendingAudioMime=null;
     playAudio(blob);
@@ -742,12 +796,19 @@ function onWsMessage(ev){
   switch(m.type){
     case 'transcript': hideTyping(); bubble(m.text,'user'); break;
     case 'assistant_text': hideTyping(); bubble(m.text,'assistant'); break;
-    case 'tts_audio_meta': pendingAudioMime=m.mime; break;
+    case 'tts_audio_meta':
+      pendingAudioMime=m.mime;
+      // streaming:true means the frames that follow are RAW PCM16 to be scheduled on the audio
+      // clock, not self-contained files to hand to an <audio> element.
+      pcmStreaming = !!(m.streaming && m.sample_rate);
+      if(pcmStreaming) pcmBegin(m.sample_rate);
+      break;
     case 'crm_created': onCrm(m.crm); break;
     case 'status':
       if(m.state==='thinking'){ showTyping(); setPill('thinking'); break; }
       if(m.state!=='idle'){ setPill(m.state); break; }
       hideTyping(); waitingForServer=false;
+      dropAudioUntilIdle=false;            // the abandoned reply is over; the next one is real
       if(m.detail==='no speech detected'){ onBrokenInput(); break; }
       endOfStream();
       break;
@@ -767,6 +828,7 @@ $('btnSend').onclick = sendTyped;
 $('typebox').addEventListener('keydown',e=>{ if(e.key==='Enter') sendTyped(); });
 $('sens').addEventListener('input',e=>{
   const v=parseFloat(e.target.value);
+  sensVal=v;   // cached here so onPcm doesn't read the DOM ~375 times a second
   $('sensval').textContent = v<0.012?'sensitive':(v>0.026?'quiet room':'normal');
 });
 
@@ -780,6 +842,10 @@ function _unlockAudio(){
     const a = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=');
     a.play().catch(()=>{});
   }catch(e){}
+  // Same reasoning for the Web Audio side: a context constructed later (after an await, once the
+  // gesture has expired) starts suspended on mobile and silently never plays. Creating and
+  // resuming it inside the gesture is the only reliable fix.
+  try{ pcmContext(); }catch(e){}
 }
 async function startTalking(){
   if(listening) return;
@@ -790,11 +856,15 @@ async function startTalking(){
   $('btnStart').classList.add('on'); $('btnStart').textContent='● On call';
   $('btnStop').disabled=false;
   getOpening();
+  // Dispatch the opener BEFORE the mic comes up. startMic() awaits getUserMedia, a fresh
+  // AudioContext AND a network fetch of the worklet module — 250ms-1s that the opener never
+  // needed, paid as dead air at pickup. The mic is only required for the caller's first REPLY,
+  // which can't arrive until the agent has finished speaking anyway.
+  if(!pack().outbound && !callOpened){ callOpened=true; sendSilent('(Call connected.)'); }
   if(CONFIG.stt==='sarvam'){ await startMic(); }
   else { startRecog(); }
   setPill('listening');
   if(pack().outbound){ armNoReply(); }   // no "Hello?" within 3s → the agent speaks first
-  else if(!callOpened){ callOpened=true; sendSilent('(Call connected.)'); }  // inbound: answer now
 }
 
 function stopTalking(){
@@ -829,11 +899,29 @@ async function sendTyped(){
 
 // ── Mic capture (Sarvam path): AudioWorklet + energy VAD + WAV encode ─────────
 let capturing=false, speechFrames=[], preRoll=[], silentSamples=0, speechSamples=0, voicedSamples=0, srate=48000;
-// SILENCE_END 420 (was 350): a natural mid-sentence pause in Hindi speech was getting cut as
-// end-of-turn, truncating the utterance's tail. MIN_SPEECH 180 (was 300): real one-word
-// answers ("हाँ", "yes") were being discarded as non-speech.
-const PREROLL_MS=300, SILENCE_END_MS=420, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
-const MIN_COMPLETE_MS=700, FRAGMENT_WAIT_MS=1100;
+// VAD threshold cached from the slider (see its input handler) and the level meter coalesced to
+// one style write per frame paint. Both used to run per 128-sample audio frame — ~375×/sec of
+// DOM reads and layout-invalidating style writes on the thread that also runs the VAD and
+// schedules playback.
+let sensVal=parseFloat(($('sens')||{}).value)||0.02, _ampVal=0, _ampRaf=0;
+function setAmp(v){
+  _ampVal=v;
+  if(_ampRaf) return;
+  _ampRaf=requestAnimationFrame(()=>{ _ampRaf=0;
+    document.documentElement.style.setProperty('--amp', _ampVal.toFixed(3)); });
+}
+// MIN_SPEECH 180 (was 300): real one-word answers ("हाँ", "yes") were being discarded as
+// non-speech.
+// MIN_COMPLETE 250 (was 700) + FRAGMENT_WAIT 700 (was 1100): the pair below was INVERTED.
+// voicedSamples only counts frames above the threshold, so a one-word answer — "हाँ", a digit,
+// "ठीक है" — carries only ~250-400ms of voiced audio, fell under a 700ms MIN_COMPLETE, and was
+// classed an unfinished fragment. The fastest and most common answers therefore waited 1100ms
+// to end the turn while a long rambling one waited 420ms. At 250 a real one-word reply takes
+// the fast branch, and only a genuine sub-250ms blip still gets the longer "they're mid-thought"
+// grace. SILENCE_END 350: this hold is now the largest remaining client-side wait, tuned as
+// tight as Hindi mid-sentence pauses allow (verified against real speech, see round notes).
+const PREROLL_MS=300, SILENCE_END_MS=350, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
+const MIN_COMPLETE_MS=250, FRAGMENT_WAIT_MS=700;
 
 async function startMic(){
   try{
@@ -867,26 +955,46 @@ function stopMic(){
 let muteUntil=0;
 function armed(){ return listening && !waitingForServer && !playing && performance.now() > muteUntil; }
 
+// ── Interrupt (barge-in) mode ────────────────────────────────────────────────
+// OFF by default, and for a measured reason: this project already tried guarded barge-in and
+// found that getUserMedia's echo cancellation PLUS a 350ms sustained-voice threshold were still
+// not enough on speakerphone — the agent heard its own voice and cut itself off mid-reply. So
+// it's opt-in: on headphones, or with the phone held to the ear, there is no echo path and
+// interrupting works properly. The 350ms sustained-voice requirement is kept regardless, so a
+// cough or a door slam can't trigger it.
+const BARGE_SUSTAIN_MS = 350;
+let bargeOn=false, bargeVoiced=0, dropAudioUntilIdle=false;
+try{ bargeOn = localStorage.getItem('uaagro_barge')==='1'; }catch(e){}
+if($('bargeToggle')){
+  $('bargeToggle').checked = bargeOn;
+  $('bargeToggle').addEventListener('change', e=>{
+    bargeOn = !!e.target.checked; bargeVoiced=0;
+    try{ localStorage.setItem('uaagro_barge', bargeOn?'1':'0'); }catch(e){}
+  });
+}
+
 // ── Streamed mic upload: ship audio to the server WHILE the caller is still speaking, so at
 // end-of-turn only the last ~250ms remains to send — the whole-utterance upload no longer sits
 // between "caller stopped" and "agent starts thinking". Frames are downsampled to 16k int16
 // client-side (same math as the batch path) and sent as WS binary between mic_start/mic_end.
 const STREAM_MIC = true;              // kill switch — false restores record-then-send
 const STREAM_CHUNK_MS = 250;
-let micStreamOpen=false, streamSent=0; // streamSent = how many source samples already shipped
+let micStreamOpen=false, streamSent=0, streamFrameIdx=0; // streamSent = source samples shipped
 function pumpMicStream(flush){
-  const totalLen = speechFrames.reduce((a,c)=>a+c.length,0);
-  const pending = totalLen - streamSent;
+  // speechSamples IS the running frame total, so use it directly. The old
+  // speechFrames.reduce() re-summed the whole growing array on every pump — O(n) per call and
+  // O(n²) across a turn (~15M ops over a 15s utterance), on the same thread running the VAD.
+  const pending = speechSamples - streamSent;
   if(pending <= 0) return;
   if(!flush && pending < srate*STREAM_CHUNK_MS/1000) return;
   if(!(ws && ws.readyState===1)){ micStreamOpen=false; return; }
-  const all=new Float32Array(pending); let o=0, skip=streamSent;
-  for(const f of speechFrames){
-    if(skip>=f.length){ skip-=f.length; continue; }
-    const part=skip? f.subarray(skip): f; skip=0;
-    all.set(part,o); o+=part.length;
+  // Only whole frames are ever shipped, so streamSent always lands on a frame boundary — a
+  // frame cursor replaces re-walking every already-sent frame on each pump.
+  const all=new Float32Array(pending); let o=0;
+  while(streamFrameIdx < speechFrames.length && o < pending){
+    const f=speechFrames[streamFrameIdx++]; all.set(f,o); o+=f.length;
   }
-  streamSent = totalLen;
+  streamSent += o;
   const i16 = floatTo16(downsample(all, srate, 16000));
   ws.send(i16.buffer);
 }
@@ -896,12 +1004,26 @@ function onPcm(chunk){
   // this returned on !armed(), so the mute window was a total dead zone: a caller who answered
   // the moment the agent finished had their first words lost with no pre-roll to recover them.
   // Capture TRIGGERING still requires armed() — only the buffering runs early.
-  if(playing || !listening){ return; }
+  if(!listening){ return; }
+  if(playing){
+    if(!bargeOn){ return; }
+    // Interrupt mode: only SUSTAINED speech over the agent's line counts, so a cough, a door
+    // slam or a single loud syllable can't stop it.
+    const bn=chunk.length; let bs=0; for(let i=0;i<bn;i++){ const v=chunk[i]; bs+=v*v; }
+    if(Math.sqrt(bs/bn) > sensVal){ bargeVoiced += bn; } else { bargeVoiced = 0; }
+    if(bargeVoiced < srate*BARGE_SUSTAIN_MS/1000){ return; }
+    bargeVoiced=0;
+    clearAudioQueue();               // cut the agent off mid-sentence
+    dropAudioUntilIdle=true;         // and ignore the rest of that reply's audio as it arrives
+    waitingForServer=false; muteUntil=0;
+    sysNote('🎧 Go ahead —');
+    // fall through: this frame begins the caller's turn
+  }
   const n=chunk.length;
   let sum=0; for(let i=0;i<n;i++){ const s=chunk[i]; sum+=s*s; }
   const rms=Math.sqrt(sum/n);
-  document.documentElement.style.setProperty('--amp', Math.min(1, rms/0.05).toFixed(3));
-  const startT=parseFloat($('sens').value);
+  setAmp(Math.min(1, rms/0.05));
+  const startT=sensVal;
   const silT=startT*0.6;
   const preMax=srate*PREROLL_MS/1000;
 
@@ -914,7 +1036,7 @@ function onPcm(chunk){
       speechSamples=speechFrames.reduce((a,c)=>a+c.length,0); silentSamples=0; voicedSamples=0;
       clearNoReply();
       micStreamOpen = STREAM_MIC && !httpMode && ws && ws.readyState===1;
-      if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000}); streamSent=0; }
+      if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000}); streamSent=0; streamFrameIdx=0; }
     }
   }else{
     speechFrames.push(chunk); speechSamples+=n;
@@ -928,6 +1050,9 @@ function onPcm(chunk){
 }
 function endTurn(){
   capturing=false;
+  // Release a reply that landed while the caller was mid-utterance — playAudio() now queues and
+  // holds it back instead of throwing it away, so this is where it gets let through.
+  if(!qActive && audioQ.length) drainAudio();
   clearNoReply();
   const streamed = micStreamOpen; micStreamOpen=false;
   const frames=speechFrames; speechFrames=[];
@@ -1010,13 +1135,60 @@ function stopRecog(){ if(recog){ try{recog.onend=null; recog.stop();}catch(e){} 
 
 // ── Playback (gates the mic so the agent never hears itself) ──────────────────
 let audioQ=[], qActive=false, streamDone=false, audioEpoch=0;
+
+// ── Streamed PCM playback ────────────────────────────────────────────────────
+// Raw 16-bit frames scheduled back-to-back on the Web Audio clock: no <audio> element, no
+// decode step, no gap. The blob queue below pays a 20-100ms element load on the first chunk and
+// leaves an audible 30-120ms hole between chunks — and, crucially, can't start until a whole
+// self-contained audio file has arrived. This path starts on the FIRST frame. Used whenever the
+// server announces streaming:true; the blob queue stays for the opener and the HTTP fallback.
+let pcmStreaming=false, pcmRate=24000, pcmNext=0, pcmCtx=null, pcmNodes=[];
+function pcmContext(){
+  if(!pcmCtx || pcmCtx.state==='closed'){ pcmCtx=new (window.AudioContext||window.webkitAudioContext)(); }
+  if(pcmCtx.state==='suspended'){ try{ pcmCtx.resume(); }catch(e){} }
+  return pcmCtx;
+}
+function pcmBegin(rate){ pcmRate=rate||24000; pcmNext=0; streamDone=false; }
+function pcmPush(buf){
+  clearFiller();                     // the real reply is starting — stop covering for it
+  const ctx=pcmContext();
+  const pcm=new Int16Array(buf);
+  if(!pcm.length) return;
+  const ab=ctx.createBuffer(1, pcm.length, pcmRate);
+  const ch=ab.getChannelData(0);
+  for(let i=0;i<pcm.length;i++) ch[i]=pcm[i]/32768;
+  const src=ctx.createBufferSource(); src.buffer=ab; src.connect(ctx.destination);
+  // 80ms lead-in on the first frame absorbs network jitter; every later frame starts exactly
+  // where the previous one ends, which is what makes it seamless rather than stitched.
+  const now=ctx.currentTime;
+  if(pcmNext < now+0.02) pcmNext = now+0.08;
+  src.start(pcmNext);
+  pcmNext += ab.duration;
+  pcmNodes.push(src);
+  src.onended=()=>{ const i=pcmNodes.indexOf(src); if(i>=0) pcmNodes.splice(i,1); pcmDone(); };
+  playing=true; setPill('speaking');
+}
+function pcmStop(){
+  pcmNodes.forEach(n=>{ try{n.stop();}catch(e){} });
+  pcmNodes=[]; pcmNext=0; pcmStreaming=false;
+}
+function pcmDone(){
+  if(pcmNodes.length) return;
+  if(audioQ.length && !qActive){ drainAudio(); return; }   // a fallback blob queued behind it
+  if(streamDone){ playing=false; afterPlay(); }
+}
+
 function clearAudioQueue(){ audioQ=[]; qActive=false; streamDone=false; playing=false; audioEpoch++;
+  pcmStop(); clearFiller();
   if(currentAudio){ try{currentAudio.pause();}catch(e){} } }
 function playAudio(blob){
-  if(capturing) return;
   if(!qActive) streamDone=false;
   audioQ.push(blob);
-  if(!qActive) drainAudio();
+  // Was `if(capturing) return;` — which DISCARDED the agent's entire reply when it happened to
+  // land while the caller was mid-utterance: no requeue, no retry, the turn was simply lost.
+  // Now it's queued and held back; endTurn() releases the queue the moment capture ends.
+  // Also held while streamed PCM is still scheduled, so the two paths can never overlap.
+  if(!qActive && !capturing && pcmNodes.length===0) drainAudio();
 }
 function drainAudio(){
   if(audioQ.length===0){
@@ -1024,6 +1196,7 @@ function drainAudio(){
     if(streamDone){ playing=false; afterPlay(); }
     return;
   }
+  clearFiller();                     // the real reply is starting — stop covering for it
   qActive=true; playing=true; setPill('speaking');
   const url=URL.createObjectURL(audioQ.shift()); const a=new Audio(url); currentAudio=a;
   const done=()=>{ try{URL.revokeObjectURL(url);}catch(e){} drainAudio(); };
@@ -1032,6 +1205,9 @@ function drainAudio(){
 }
 function endOfStream(){
   streamDone=true;
+  // Streamed PCM is scheduled AHEAD on the audio clock, so "server finished sending" is not
+  // "caller finished hearing" — pcmDone() ends the turn when the last frame actually plays out.
+  if(pcmNodes.length) return;
   if(!qActive && audioQ.length===0){ playing=false; afterPlay(); }
 }
 function afterPlay(){

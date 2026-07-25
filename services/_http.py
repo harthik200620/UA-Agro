@@ -16,7 +16,10 @@ def client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(40.0, connect=10.0),
-            limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=60.0),
+            # 40s read was pointless: the platform kills the function around 10-15s, so a stall
+            # could never recover — it just 504'd the caller. 12s lets a stalled call drop into
+            # the key rotation / hedge while there is still budget left to answer with.
+            timeout=httpx.Timeout(12.0, connect=3.0),
+            limits=httpx.Limits(max_keepalive_connections=16, keepalive_expiry=90.0),
         )
     return _client

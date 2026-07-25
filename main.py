@@ -13,6 +13,7 @@ Run:  python -m uvicorn main:app --reload --port 8000   ->  http://localhost:800
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -166,6 +167,44 @@ async def api_opening(password: str = Form(default=""), scenario: str = Form(def
         return {"text": text, "audio_b64": None, "audio_mime": None}
     audio_b64, mime = await _opening_audio(scenario, lng)
     return {"text": text, "audio_b64": audio_b64, "audio_mime": mime}
+
+
+# Short spoken acknowledgements played the instant the caller stops talking, while the model is
+# still thinking. The MEASURED reason they exist: Gemini's time-to-first-token on this tier is
+# ~1.25s of FIXED overhead — a one-word reply costs the same as a full sentence, and removing
+# thinkingLevel:minimal triples it — so that wait cannot be optimised away, only covered, the way
+# a person says "mm-hm" while they think. Synthesized once per process; the client holds them in
+# memory so playing one costs no network at all.
+_ACK_LINES = {
+    "hindi": ["जी…", "अच्छा…", "जी, समझ गई…", "हाँ जी…"],
+    "english": ["Mm-hmm…", "Right…", "I see…", "Sure…"],
+}
+_ack_cache: dict[str, list] = {}
+
+
+async def _ack_clips(lng: str) -> list[dict]:
+    key = f"{tts.active_provider()}::{tts._voice_for(lng)}::{tts._model_for(lng)}::{lng}"
+    if key in _ack_cache:
+        return _ack_cache[key]
+    out = []
+    for line in _ACK_LINES.get(lng, _ACK_LINES["english"]):
+        try:
+            a, m = await tts.synthesize(line, lng)      # serial: the free tier allows 2 at once
+        except Exception:                                # and the opener may still be rendering
+            a, m = None, None
+        if a:
+            out.append({"audio_b64": base64.b64encode(a).decode("ascii"), "mime": m})
+    _ack_cache[key] = out
+    return out
+
+
+@app.post("/api/acks")
+async def api_acks(password: str = Form(default=""), scenario: str = Form(default="sales"),
+                   lang: str = Form(default="")):
+    lng = norm_lang(lang, scenario)
+    if scenario_of(scenario)["chat"]:
+        return {"acks": []}
+    return {"acks": await _ack_clips(lng)}
 
 
 @app.post("/api/say")
@@ -367,7 +406,24 @@ async def api_turn(
 
 
 async def _send(ws: WebSocket, obj: dict):
-    await ws.send_text(json.dumps(obj, ensure_ascii=False))
+    async with _lock_for(ws):
+        await ws.send_text(json.dumps(obj, ensure_ascii=False))
+
+
+def _lock_for(ws: WebSocket) -> asyncio.Lock:
+    lock = getattr(ws, "_uaagro_send_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(ws, "_uaagro_send_lock", lock)
+    return lock
+
+
+async def _send_bytes(ws: WebSocket, data: bytes):
+    """Every frame leaves under ONE per-connection lock. On the streaming path the audio
+    forwarder task and the turn coroutine both write to this socket, and letting a text frame
+    interleave into a binary one would corrupt the stream."""
+    async with _lock_for(ws):
+        await ws.send_bytes(data)
 
 
 _SENT_END = re.compile(r"[.!?…।]\s")
@@ -395,6 +451,9 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         await _send(ws, {"type": "status", "state": "idle"})
         return
     sid = state["session_id"]
+    # End-of-speech timestamp when this turn came from the mic — the only honest zero point for
+    # "how long until the caller hears something", since it includes STT.
+    t_turn0 = state.pop("t_turn0", None)
     scenario = state.get("scenario", "sales")
     sc = scenario_of(scenario)
     lng = norm_lang(state.get("lang", ""), scenario)
@@ -414,7 +473,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         if audio_b64:
             audio = base64.b64decode(audio_b64)
             await _send(ws, {"type": "tts_audio_meta", "mime": mime, "bytes": len(audio)})
-            await ws.send_bytes(audio)
+            await _send_bytes(ws, audio)
         await _send(ws, {"type": "status", "state": "idle"})
         return
 
@@ -422,15 +481,56 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
 
     captured = {"crm": None}
     t_turn = time.perf_counter()
+    t_zero = t_turn0 or t_turn       # end-of-speech if known, else the start of thinking
+    ttfa_ms = None
+    first_clause_ms = None           # when the LLM had enough words to start synthesising
 
     async def on_row(row: dict):
         await _send(ws, {"type": "crm_created", "crm": row})
         db.log_turn(sid, "tool", "crm " + json.dumps(row, ensure_ascii=False))
 
+    # ── STREAMED TURN ──────────────────────────────────────────────────────────────────────
+    # Gemini's clauses go into the ElevenLabs socket as they are written; its audio goes out to
+    # the browser as it comes back. The three stages OVERLAP instead of running end to end, so
+    # the first sound lands while the model is still generating the rest of the sentence. If the
+    # socket can't be opened (flag off, no websockets lib, dead key) `stream` stays None and the
+    # blocking synth below runs exactly as it always did.
+    stream = None
+    if not sc["chat"]:
+        cand = tts.ElevenStream(lng)
+        if cand.usable():
+            cand.start()             # handshake overlaps the LLM's time-to-first-token
+            stream = cand
+
+    fwd = None
+    if stream is not None:
+        async def _forward():
+            nonlocal ttfa_ms
+            first = True
+            try:
+                async for buf in stream.chunks():
+                    if first:
+                        first = False
+                        ttfa_ms = round((time.perf_counter() - t_zero) * 1000)
+                        await _send(ws, {"type": "tts_audio_meta", "mime": stream.mime,
+                                         "sample_rate": stream.sample_rate, "streaming": True})
+                        await _send(ws, {"type": "status", "state": "speaking"})
+                    await _send_bytes(ws, buf)
+            except Exception:
+                pass          # caller hung up mid-reply — the turn is over, nothing to report
+        fwd = asyncio.ensure_future(_forward())
+
+    async def _on_clause(clause: str):
+        nonlocal first_clause_ms
+        if first_clause_ms is None:
+            first_clause_ms = round((time.perf_counter() - t_zero) * 1000)
+        await stream.feed(clause)
+
     try:
         assistant_text = await llm.gemini_turn(
             state["contents"], text,
             _handlers_for(scenario, captured, on_row), scenario=scenario, lang=lng,
+            on_clause=(_on_clause if stream is not None else None),
         )
     except Exception as e:
         # Graceful recovery — log the real error, speak a "say that again?" line.
@@ -446,27 +546,63 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         await _send(ws, {"type": "status", "state": "idle"})
         return
 
-    await _send(ws, {"type": "status", "state": "speaking"})
-    # Sentence-by-sentence, SEQUENTIAL on purpose: chunk 2 synthesizes while chunk 1 is already
-    # playing in the browser, and staying at 1 concurrent request keeps the ElevenLabs free
-    # tier (2-concurrent limit) from 429ing when fillers or /api/say overlap.
     t0 = time.perf_counter()
-    for chunk in _split_for_tts(assistant_text):
-        try:
-            audio, mime = await tts.synthesize(chunk, lng)
-        except Exception:
-            audio, mime = None, None
-        if audio:
-            await _send(ws, {"type": "tts_audio_meta", "mime": mime, "bytes": len(audio)})
-            await ws.send_bytes(audio)
+    rest = assistant_text
+    if stream is not None:
+        # What has the caller ALREADY heard? Exactly what the socket accepted. The final text is
+        # normally a strict extension of it; it can also be CONTAINED in it (a tool re-ask, where
+        # turn 1 was spoken and turn 2's line is the one returned), or diverge outright (a canned
+        # fallback replacing a too-short model line). Only the genuinely unspoken remainder is
+        # ever synthesised, so the caller never hears the same line twice.
+        said, final = llm.norm_spoken(stream.spoken), llm.norm_spoken(assistant_text)
+        if not said:
+            rest = final
+        elif final in said:
+            rest = ""
+        elif final.startswith(said):
+            rest = final[len(said):].strip()
+        else:
+            rest = final
+        if rest and stream.ok:
+            await stream.feed(rest)
+            rest = ""
+        await stream.finish()
+        if fwd is not None:
+            try:
+                await fwd
+            except Exception:
+                pass
+        if not stream.got_audio:     # socket produced nothing at all — blocking synth still owes it
+            rest = final
+
+    if rest:
+        await _send(ws, {"type": "status", "state": "speaking"})
+        # Sentence-by-sentence, SEQUENTIAL on purpose: chunk 2 synthesizes while chunk 1 is
+        # already playing in the browser, and staying at 1 concurrent request keeps the
+        # ElevenLabs free tier (2-concurrent limit) from 429ing when fillers or /api/say overlap.
+        for chunk in _split_for_tts(rest):
+            try:
+                audio, mime = await tts.synthesize(chunk, lng)
+            except Exception:
+                audio, mime = None, None
+            if audio:
+                if ttfa_ms is None:
+                    ttfa_ms = round((time.perf_counter() - t_zero) * 1000)
+                await _send(ws, {"type": "tts_audio_meta", "mime": mime, "bytes": len(audio)})
+                await _send_bytes(ws, audio)
     tts_ms = round((time.perf_counter() - t0) * 1000)
-    # Same per-turn stage telemetry as /api/turn — production calls run over WS too.
-    print(f"[timing/ws] {round((time.perf_counter() - t_turn) * 1000)}ms total | llm {llm_ms} "
-          f"(x{llm.last_attempt_count} {llm.last_served_by}) | tts {tts_ms}")
+    # first-audio is THE number that matters to a caller; the rest is bookkeeping.
+    print(f"[timing/ws] first-audio {ttfa_ms if ttfa_ms is not None else '-'}ms | "
+          f"first-clause {first_clause_ms if first_clause_ms is not None else '-'}ms | "
+          f"llm {llm_ms} (x{llm.last_attempt_count} {llm.last_served_by}) | tts {tts_ms} | "
+          f"stream={'on' if stream is not None else 'off'}", flush=True)
     await _send(ws, {"type": "status", "state": "idle"})
 
 
 async def _process_audio(ws: WebSocket, state: dict, wav: bytes):
+    # Zero point for time-to-first-audio: the caller has stopped speaking and everything from
+    # here — STT included — is wait. _process_text pops it.
+    state["t_turn0"] = time.perf_counter()
     await _send(ws, {"type": "status", "state": "transcribing"})
     lng = norm_lang(state.get("lang", ""), state.get("scenario", "sales"))
     t0 = time.perf_counter()
@@ -499,7 +635,10 @@ async def ws_endpoint(ws: WebSocket):
                 # PCM16 chunks shipped WHILE the caller speaks — buffer them. Otherwise it's
                 # the legacy single complete-WAV upload.
                 if state.get("mic_frames") is not None:
-                    state["mic_frames"].append(msg["bytes"])
+                    state["mic_frames"].append(msg["bytes"])   # kept as the batch fallback
+                    sstream = state.get("stt_stream")
+                    if sstream is not None:
+                        await sstream.feed(msg["bytes"])       # …and transcribed as it arrives
                 else:
                     await _process_audio(ws, state, msg["bytes"])
                 continue
@@ -512,13 +651,39 @@ async def ws_endpoint(ws: WebSocket):
 
             if mtype == "mic_start":
                 state["mic_frames"] = []
+                # Open Sarvam's socket NOW and transcribe frames as they arrive, so the transcript
+                # is ready the moment the caller stops rather than after a whole-utterance POST.
+                lng0 = norm_lang(state.get("lang", ""), state.get("scenario", "sales"))
+                sstream = stt.SarvamStream(_LANG_CODE.get(lng0, "en-IN"))
+                sstream.start()
+                state["stt_stream"] = sstream if sstream.usable() else None
             elif mtype == "mic_end":
                 frames = state.get("mic_frames") or []
                 state["mic_frames"] = None
-                if frames:
+                sstream = state.pop("stt_stream", None)
+                text = ""
+                if frames and sstream is not None:
+                    state["t_turn0"] = time.perf_counter()      # the caller stopped speaking HERE
+                    t_stt = time.perf_counter()
+                    try:
+                        text = await sstream.finish()
+                    except Exception:
+                        text = ""
+                    print(f"[timing/ws] stt-stream {round((time.perf_counter() - t_stt) * 1000)}ms"
+                          f" | {'hit' if text else 'MISS -> batch'}", flush=True)
+                elif sstream is not None:
+                    await sstream.cancel()
+                if text:
+                    await _process_text(ws, state, text)
+                elif frames:
+                    # Socket failed or returned nothing — the frames were buffered all along, so
+                    # this costs correctness nothing, only the latency saving.
                     await _process_audio(ws, state, _pcm16_to_wav(b"".join(frames)))
             elif mtype == "mic_abort":
                 state["mic_frames"] = None
+                sstream = state.pop("stt_stream", None)
+                if sstream is not None:
+                    await sstream.cancel()
             elif mtype == "hello":
                 if data.get("scenario"):
                     state["scenario"] = data["scenario"]
