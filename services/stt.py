@@ -89,6 +89,137 @@ async def transcribe_wav(wav_bytes: bytes, language_code: str = "en-IN") -> str:
     raise RuntimeError(last_err or "Sarvam STT failed")
 
 
+# ── MODEL-BASED TURN DETECTION (Deepgram Flux) ─────────────────────────────────────────────
+# WHY THIS EXISTS. End-of-turn was retuned four times against loudness thresholds and kept
+# failing, because loudness cannot tell you whether a SENTENCE finished — a caller drawing breath
+# mid-thought is silent in exactly the way a caller who is done is silent. The field solved this
+# with models that judge the speech itself; LiveKit reports a 9.9% false-cutoff rate at a 300ms
+# budget against 27.7% for a tuned VAD. Deepgram Flux Multilingual (GA 2026-04-29) does the same
+# thing inside the recogniser, supports Hindi, and switches language mid-conversation — which is
+# exactly this project's code-mix case.
+#
+# The cheaper alternative was ruled out by MEASUREMENT, not preference: Sarvam's socket emits ZERO
+# transcript segments while audio is streaming (verified — everything lands only after flush), so
+# the browser can never adapt its silence window from the words so far. The turn boundary has to
+# come from somewhere that can actually see the speech.
+#
+# DORMANT WITHOUT A KEY. usable() is False with no DEEPGRAM_API_KEY, and every caller falls back
+# to the existing client-VAD + Sarvam path unchanged.
+DEEPGRAM_KEY = _clean("DEEPGRAM_API_KEY")
+DEEPGRAM_MODEL = _clean("DEEPGRAM_MODEL", "flux-general-multi")
+TURN_DETECTOR = _clean("TURN_DETECTOR", "flux").lower()     # "vad" forces the old path
+# 0.7 is Deepgram's default (range 0.5-0.9): higher = surer the caller finished, at the cost of
+# waiting longer. eot_timeout_ms is the FORCED cutoff when the model never gets confident — their
+# default of 5000 is an eternity on a call, and it is a backstop, not the normal path.
+_EOT_THRESHOLD = _clean("DEEPGRAM_EOT_THRESHOLD", "0.7")
+_EOT_TIMEOUT_MS = _clean("DEEPGRAM_EOT_TIMEOUT_MS", "3000")
+# eager_eot_threshold is deliberately UNSET. It starts the LLM speculatively before the turn is
+# confirmed, and Deepgram documents a 50-70% increase in LLM calls for it — on a Gemini pool that
+# is already 429-exhausted that buys latency by spending the exact resource that is failing.
+_DG_URL = ("wss://api.deepgram.com/v2/listen?model={model}&encoding=linear16&sample_rate=16000"
+           "&eot_threshold={eot}&eot_timeout_ms={timeout}{hints}")
+# Deepgram's own recommendation for this socket; the browser paces frames to match.
+FLUX_FRAME_MS = 80
+
+_DG_HINTS = {"hindi": ("hi", "en"), "english": ("en",), "telugu": ("hi", "en")}
+
+
+def flux_available() -> bool:
+    return bool(DEEPGRAM_KEY and websockets and TURN_DETECTOR != "vad")
+
+
+class FluxStream:
+    """One Deepgram Flux socket, alive for a WHOLE CALL — not one turn.
+
+    That lifetime is the point: Flux decides where the turns are, so it must hear the
+    conversation continuously. open() -> feed(pcm) forever -> close(). Turn boundaries arrive as
+    callbacks: on_start when the caller begins speaking, on_end with the finished transcript.
+
+    `ok` goes False on any failure and the caller reverts to the client-VAD + Sarvam path for the
+    rest of the call — a dead turn detector must never mean a dead microphone.
+    """
+
+    def __init__(self, lang: str = "hindi", on_start=None, on_end=None):
+        self.lang = (lang or "hindi").lower()
+        self.ok = False
+        self.err = ""
+        self.turns = 0
+        self._ws = None
+        self._reader: asyncio.Task | None = None
+        self._on_start = on_start
+        self._on_end = on_end
+
+    def usable(self) -> bool:
+        return flux_available()
+
+    async def open(self) -> bool:
+        if not self.usable():
+            self.err = "no DEEPGRAM_API_KEY" if not DEEPGRAM_KEY else "disabled"
+            return False
+        hints = "".join(f"&language_hint={h}" for h in _DG_HINTS.get(self.lang, ("en",)))
+        url = _DG_URL.format(model=DEEPGRAM_MODEL, eot=_EOT_THRESHOLD,
+                             timeout=_EOT_TIMEOUT_MS, hints=hints)
+        hdrs = {"Authorization": f"Token {DEEPGRAM_KEY}"}
+        try:
+            try:
+                conn = websockets.connect(url, additional_headers=hdrs, max_size=None)
+            except TypeError:                     # websockets < 14 spelled it extra_headers
+                conn = websockets.connect(url, extra_headers=hdrs, max_size=None)
+            self._ws = await asyncio.wait_for(conn, timeout=6)
+        except Exception as exc:
+            code = getattr(getattr(exc, "response", None), "status_code", 0) or 0
+            self.err = f"{type(exc).__name__} {code or ''}".strip()
+            self._ws = None
+            return False
+        self._reader = asyncio.ensure_future(self._read())
+        self.ok = True
+        return True
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self._ws:
+                try:
+                    m = json.loads(raw)
+                except Exception:
+                    continue
+                if m.get("type") != "TurnInfo":
+                    continue
+                ev = m.get("event")
+                if ev == "StartOfTurn" and self._on_start:
+                    await self._on_start()
+                elif ev == "EndOfTurn":
+                    self.turns += 1
+                    text = (m.get("transcript") or "").strip()
+                    if self._on_end:
+                        await self._on_end(text)
+                # EagerEndOfTurn / TurnResumed are not subscribed to (see the eager note above),
+                # and Update is interim text we have no use for — the browser shows no live caption.
+        except Exception:
+            pass
+        finally:
+            self.ok = False
+
+    async def feed(self, pcm16: bytes) -> None:
+        """Raw PCM16 @16k, exactly as the browser produces it — no WAV wrapper, unlike Sarvam."""
+        if not (self.ok and self._ws and pcm16):
+            return
+        try:
+            await self._ws.send(pcm16)
+        except Exception:
+            self.ok = False
+
+    async def close(self) -> None:
+        self.ok = False
+        if self._reader is not None and not self._reader.done():
+            self._reader.cancel()
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
 # ── STREAMING STT ──────────────────────────────────────────────────────────────────────────
 # The browser already ships PCM frames to us WHILE the caller speaks, but the batch endpoint
 # above can't start until they stop — so a whole POST of the whole utterance sat between "caller

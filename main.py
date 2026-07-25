@@ -88,6 +88,11 @@ async def config():
             "telugu": tts._voice_for("telugu"),
         },
         "telugu_tts": tts.TELUGU_TTS,   # "sarvam" (fast/native) or "elevenlabs"
+        # Which end-of-turn detector the page should use. "flux" = Deepgram decides turn
+        # boundaries with a model; "vad" = the browser's own energy VAD, as before. The page
+        # reads this, so with no DEEPGRAM_API_KEY the client behaves exactly as it did.
+        "turn_detector": "flux" if stt.flux_available() else "vad",
+        "flux_frame_ms": stt.FLUX_FRAME_MS,
     }
 
 
@@ -815,6 +820,20 @@ async def ws_endpoint(ws: WebSocket):
                 break
 
             if msg.get("bytes") is not None:
+                # FLUX MODE: the socket is open for the whole call and Deepgram decides where the
+                # turns are, so frames just flow straight through — there is no client-side
+                # start/end at all. Checked first because in this mode `mic_frames` is never set.
+                flux = state.get("flux")
+                if flux is not None:
+                    if flux.ok:
+                        await flux.feed(msg["bytes"])
+                        continue
+                    # The socket died mid-call. Hand the microphone back to the client's own VAD
+                    # for the rest of the call rather than silently swallowing every frame.
+                    state["flux"] = None
+                    _log(f"[flux] lost mid-call after {flux.turns} turn(s) — reverting to VAD")
+                    await _send(ws, {"type": "turn_mode", "mode": "vad"})
+                    continue
                 # Streamed-mic mode: between mic_start/mic_end the binary frames are raw 16k
                 # PCM16 chunks shipped WHILE the caller speaks — buffer them. Otherwise it's
                 # the legacy single complete-WAV upload.
@@ -833,7 +852,36 @@ async def ws_endpoint(ws: WebSocket):
             data = json.loads(raw)
             mtype = data.get("type")
 
-            if mtype == "mic_start":
+            if mtype == "flux_open":
+                # One socket for the whole call. The client asks for this once, at call start,
+                # and only when /config advertised flux — so with no key nothing here ever runs.
+                if data.get("lang"):
+                    state["lang"] = data["lang"]
+                lng0 = norm_lang(state.get("lang", ""), state.get("scenario", "sales"))
+
+                async def _turn_started():
+                    await _send(ws, {"type": "status", "state": "listening"})
+
+                async def _turn_ended(text: str):
+                    # Deepgram says the caller finished. That is the whole point of Flux: this
+                    # decision came from a model that heard the speech, not from a silence timer.
+                    state["t_turn0"] = time.perf_counter()
+                    if text:
+                        await _process_text(ws, state, text)
+                    else:
+                        await _send(ws, {"type": "status", "state": "idle"})
+
+                fx = stt.FluxStream(lng0, on_start=_turn_started, on_end=_turn_ended)
+                opened = await fx.open()
+                state["flux"] = fx if opened else None
+                _log(f"[flux] open={opened} lang={lng0} model={stt.DEEPGRAM_MODEL}"
+                     f"{'' if opened else ' err=' + fx.err}")
+                # Tell the client which mode it is actually in. If Flux did not open it must go
+                # straight back to its own VAD — a failed turn detector must never mean a dead mic.
+                await _send(ws, {"type": "turn_mode",
+                                 "mode": "flux" if opened else "vad",
+                                 "frame_ms": stt.FLUX_FRAME_MS})
+            elif mtype == "mic_start":
                 state["mic_frames"] = []
                 # The client stamps the language on every mic_start. Previously this frame carried
                 # none, so the transcription language came only from `hello` — and if that was
@@ -911,3 +959,12 @@ async def ws_endpoint(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+    finally:
+        # The Flux socket is per-CALL, so it has to be closed with the call — otherwise every
+        # hang-up leaks a Deepgram connection (and keeps billing).
+        fx = state.get("flux")
+        if fx is not None:
+            try:
+                await fx.close()
+            except Exception:
+                pass

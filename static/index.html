@@ -714,6 +714,12 @@ function connectWS(){
       clearTimeout(to);
       if(stale()){ try{ sock.close(); }catch(e){} return; }
       sock.send(JSON.stringify({type:'hello', password: adminPw, scenario: sessionScenario, lang: sessionLang}));
+      // Ask for model-based turn detection when the server says it has a Deepgram key. The
+      // server answers with turn_mode, and ONLY that answer flips fluxMode — so if the socket
+      // fails to open we stay on the browser VAD without the caller noticing anything.
+      if(CONFIG && CONFIG.turn_detector === 'flux'){
+        sock.send(JSON.stringify({type:'flux_open', lang: sessionLang}));
+      }
       resolve();
     };
     sock.onerror=(e)=>{ clearTimeout(to); if(!stale()) reject(e); };
@@ -932,6 +938,15 @@ function onWsMessage(ev){
       if(m.detail==='no speech detected'){ onBrokenInput(); break; }
       endOfStream();
       break;
+    case 'turn_mode':
+      // The server is the authority on this, never the client's optimism: it only says "flux"
+      // once the Deepgram socket is actually open, and says "vad" again the moment it dies.
+      fluxMode = (m.mode === 'flux');
+      if(m.frame_ms) fluxFrameMs = m.frame_ms;
+      fluxBuf=[]; fluxBufN=0;
+      if(!fluxMode && micStreamOpen){ micStreamOpen=false; }   // never strand a half-open turn
+      console.log('[turn] detector =', m.mode);
+      break;
     case 'error':
       hideTyping();
       bubble('⚠ '+(m.where||'')+': '+m.message,'assistant');
@@ -990,6 +1005,7 @@ async function startTalking(){
 function stopTalking(){
   listening=false;
   clearNoReply(); noReplyCount=0; endingCall=false; closeRequested=false; capabilityNudgeSent=false;
+  fluxMode=false; fluxBuf=[]; fluxBufN=0;   // a new call re-negotiates the detector
   $('btnStart').classList.remove('on'); $('btnStart').textContent=pack().startLabel||'📞 Start call';
   $('btnStop').disabled=true;
   stopMic(); stopRecog();
@@ -1238,6 +1254,29 @@ function pumpMicStream(flush){
   const i16 = floatTo16(downsample(all, srate, 16000));
   ws.send(i16.buffer);
 }
+// ── FLUX MODE ────────────────────────────────────────────────────────────────
+// When Deepgram Flux is the turn detector the browser stops deciding anything about turns: it
+// just ships a continuous 80ms stream and the model says where the boundaries are. The VAD above
+// still runs, but only for the level meter and barge-in.
+// Silence is streamed when the mic is muted (agent speaking, or a turn in flight) rather than
+// pausing the stream — a socket that goes quiet risks being timed out, and Flux seeing real
+// silence is exactly the right signal anyway.
+let fluxMode=false, fluxBuf=[], fluxBufN=0, fluxFrameMs=80, _fluxSilence=null;
+function fluxPush(chunk){
+  if(!(ws && ws.readyState===1)){ return; }
+  fluxBuf.push(chunk); fluxBufN+=chunk.length;
+  const need=Math.max(1, Math.round(srate*fluxFrameMs/1000));
+  while(fluxBufN>=need){
+    const out=new Float32Array(need); let o=0;
+    while(o<need){
+      const f=fluxBuf[0], take=Math.min(f.length, need-o);
+      out.set(take===f.length ? f : f.subarray(0,take), o); o+=take;
+      if(take===f.length) fluxBuf.shift(); else fluxBuf[0]=f.subarray(take);
+    }
+    fluxBufN-=need;
+    try{ ws.send(floatTo16(downsample(out, srate, 16000)).buffer); }catch(e){ return; }
+  }
+}
 function onPcm(chunk){
   // Keep the pre-roll ring FILLING whenever the mic is open and the agent isn't speaking —
   // including the short post-playback mute window and while waiting on the server. Previously
@@ -1323,6 +1362,21 @@ function onPcm(chunk){
                               armed:armed(), silentMs:silentRun/srate*1000,
                               quietMs:nowMs-lastVoiceAt};
   const preMax=srate*PREROLL_MS/1000;
+
+  // FLUX: everything below this line is the browser deciding where turns are, which is exactly
+  // the job Deepgram has taken over. Stream and stop — no capture, no silence accumulator, no
+  // end-of-turn arithmetic. The meter and thresholds above still run so the level display and
+  // barge-in keep working.
+  if(fluxMode){
+    const open = listening && !playing && !waitingForServer && nowMs > muteUntil;
+    if(!open){
+      if(!_fluxSilence || _fluxSilence.length !== n) _fluxSilence = new Float32Array(n);
+      fluxPush(_fluxSilence);
+    }else{
+      fluxPush(chunk);
+    }
+    return;
+  }
 
   if(!capturing){
     preRoll.push(chunk);
