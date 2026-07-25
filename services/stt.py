@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import struct
+import unicodedata
 
 import httpx
 
@@ -112,14 +113,31 @@ def join_segments(parts: list[str]) -> str:
     the boundary ("… पर" then "पर सफ़ेद …"). Taking only the first segment silently truncated the
     caller's sentence (measured: the actual question was dropped); joining naively duplicated
     words. Join everything, trimming a word-level overlap at each seam."""
+    def bare(x: str) -> str:
+        """Compare-only form. Decomposes and drops the nukta: Sarvam is inconsistent about it
+        across a segment seam, writing "सफ़ेद" then "फेद", and with the mark left in place the
+        overlap check silently misses (फ+़ never matches a bare फ)."""
+        return unicodedata.normalize("NFD", x.strip("।,?.!‍")).replace("़", "")
+
     out: list[str] = []
     for seg in parts:
         w = (seg or "").split()
-        if out and w:
+        if out and w:                       # whole-word overlap: "… पर" + "पर सफ़ेद …"
             for k in range(min(4, len(out), len(w)), 0, -1):
-                if [x.strip("।,?.!") for x in out[-k:]] == [x.strip("।,?.!") for x in w[:k]]:
+                if [bare(x) for x in out[-k:]] == [bare(x) for x in w[:k]]:
                     w = w[k:]
                     break
+        if out and w:
+            # PARTIAL-word overlap. Sarvam can split a word ACROSS the seam and re-recognise its
+            # tail, which produced a real "सफ़ेद" + "फेद कीड़े" -> "सफ़ेद फेद कीड़े" in testing.
+            # Deliberately conservative: only a proper suffix of 3+ characters counts, because
+            # dropping a legitimate short word (Hindi has plenty that tail-match a neighbour)
+            # would be a worse bug than leaving a visible stutter in.
+            a, b = bare(out[-1]), bare(w[0])
+            if a != b and len(b) >= 3 and len(a) > len(b) and a.endswith(b):
+                w = w[1:]                   # b is only the tail of a — drop it
+            elif a != b and len(a) >= 3 and len(b) > len(a) and b.startswith(a):
+                out.pop()                   # b is the fuller form of a — keep b
         out.extend(w)
     return " ".join(out).strip()
 

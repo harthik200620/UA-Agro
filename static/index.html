@@ -426,7 +426,7 @@ function chooseScenario(s, l){
 // (TCP + TLS + HTTP upgrade) and the AudioWorklet module fetch both used to land on the
 // "Answer call" click, where they are pure dead air on the critical path.
 function warmUp(){
-  try{ ensureWS(); }catch(e){}                                       // fire and forget
+  try{ ensureWS(true); }catch(e){}                                   // fire and forget
   try{ fetch('/static/pcm-worklet.js',{cache:'force-cache'}).catch(()=>{}); }catch(e){}
   // Acks AFTER the opener, never alongside it: the ElevenLabs free tier allows 2 concurrent
   // synths and this project has already had real 429 storms from stacking them at pickup.
@@ -623,35 +623,65 @@ function setPill(state){
 }
 
 // ── WebSocket ────────────────────────────────────────────────────────────────
+// Every socket carries an epoch, and handlers ignore events from any socket that is no longer
+// the current one. This is not theoretical: warmUp() opens a socket during the scenario picker,
+// and a caller who tapped "Answer call" while it was still CONNECTING got a SECOND socket — then
+// the orphaned first one's onclose fired "line dropped" and ENDED the live call, and its
+// onmessage could still inject frames. On the phone that looked exactly like "it stopped taking
+// my voice".
+let wsEpoch=0, wsPending=null;
 function connectWS(){
+  if(ws){                       // retire the previous socket so it can never touch state again
+    try{ ws.onopen=ws.onerror=ws.onclose=ws.onmessage=null; ws.close(); }catch(e){}
+    ws=null;
+  }
+  const epoch = ++wsEpoch;
+  const stale = ()=> epoch !== wsEpoch;
   return new Promise((resolve,reject)=>{
+    let sock;
     try{
       const proto = location.protocol==='https:'?'wss':'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      sock = new WebSocket(`${proto}://${location.host}/ws`);
     }catch(e){ return reject(e); }
-    ws.binaryType='arraybuffer';
+    ws = sock;
+    sock.binaryType='arraybuffer';
     const to=setTimeout(()=>reject(new Error('ws timeout')), 3500);
-    ws.onopen=()=>{ clearTimeout(to); ws.send(JSON.stringify({type:'hello', password: adminPw, scenario: sessionScenario, lang: sessionLang})); resolve(); };
-    ws.onerror=(e)=>{ clearTimeout(to); reject(e); };
+    sock.onopen=()=>{
+      clearTimeout(to);
+      if(stale()){ try{ sock.close(); }catch(e){} return; }
+      sock.send(JSON.stringify({type:'hello', password: adminPw, scenario: sessionScenario, lang: sessionLang}));
+      resolve();
+    };
+    sock.onerror=(e)=>{ clearTimeout(to); if(!stale()) reject(e); };
     // If the socket drops MID-CALL (serverless WS duration cap, flaky mobile network), never
     // leave a zombie call that ignores the caller forever: end it visibly and cleanly.
-    ws.onclose=()=>{
+    sock.onclose=()=>{
+      if(stale()) return;                      // a retired socket must never end a live call
       if(listening && !endingCall){
         sysNote('📴 Line dropped — call ended. Tap Start to call again.');
         endCall();
       }
     };
-    ws.onmessage=onWsMessage;
+    sock.onmessage=(ev)=>{ if(!stale()) onWsMessage(ev); };
   });
 }
 function wsSend(obj){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(obj)); }
 
 // Try a WebSocket once; if it can't connect, switch to HTTP (/api/turn) mode for good.
-async function ensureWS(){
+// `warm` = the speculative connect during the scenario picker: it must never RACE a second
+// socket against one already connecting, and it must never latch httpMode for the whole page
+// on a transient failure — the attempt that counts is the one when the caller taps Answer call.
+async function ensureWS(warm){
   if(httpMode) return false;
   if(ws && ws.readyState===1) return true;
-  try{ await connectWS(); return true; }
-  catch(e){ httpMode=true; return false; }
+  if(wsPending){                                  // reuse the in-flight connect, don't duplicate
+    try{ await wsPending; }catch(e){}
+    return !!(ws && ws.readyState===1);
+  }
+  wsPending = connectWS();
+  try{ await wsPending; return true; }
+  catch(e){ if(!warm) httpMode=true; return false; }
+  finally{ wsPending=null; }
 }
 function b64toBlob(b64, mime){
   const bin=atob(b64), u8=new Uint8Array(bin.length);
@@ -903,7 +933,7 @@ let capturing=false, speechFrames=[], preRoll=[], silentSamples=0, speechSamples
 // one style write per frame paint. Both used to run per 128-sample audio frame — ~375×/sec of
 // DOM reads and layout-invalidating style writes on the thread that also runs the VAD and
 // schedules playback.
-let sensVal=parseFloat(($('sens')||{}).value)||0.02, _ampVal=0, _ampRaf=0;
+let sensVal=parseFloat(($('sens')||{}).value)||0.02, _ampVal=0, _ampRaf=0, micFrames=0;
 function setAmp(v){
   _ampVal=v;
   if(_ampRaf) return;
@@ -936,6 +966,11 @@ async function startMic(){
     return;
   }
   audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  // This context is constructed AFTER the getUserMedia await, so the user gesture has already
+  // expired — on mobile Safari/Chrome it can therefore start SUSPENDED, in which case the
+  // worklet never runs, onPcm is never called, and the mic silently does nothing at all with no
+  // error anywhere. That is precisely what "it isn't taking my voice" looks like on a phone.
+  try{ if(audioCtx.state==='suspended') await audioCtx.resume(); }catch(e){}
   srate = audioCtx.sampleRate;
   await audioCtx.audioWorklet.addModule('/static/pcm-worklet.js');
   sourceNode = audioCtx.createMediaStreamSource(micStream);
@@ -943,6 +978,19 @@ async function startMic(){
   workletNode.port.onmessage = e => onPcm(e.data);
   sourceNode.connect(workletNode);
   workletNode.connect(audioCtx.destination);
+  // Watchdog: if not a single audio frame arrives, the mic is dead. Try once more to resume,
+  // then SAY so — a silent dead mic is the worst possible failure in a live demo.
+  micFrames = 0;
+  setTimeout(async ()=>{
+    if(micFrames || !listening) return;
+    try{ await audioCtx.resume(); }catch(e){}
+    setTimeout(()=>{
+      if(micFrames || !listening) return;
+      sysNote('🎤 No sound reaching the mic. Tap anywhere on the page once, check the browser\'s '
+            + 'microphone permission for this site, then press Stop and Answer call again — '
+            + 'or just type your question below.');
+    }, 1800);
+  }, 1800);
   capturing=false; speechFrames=[]; preRoll=[]; silentSamples=0; speechSamples=0; voicedSamples=0;
 }
 function stopMic(){
@@ -1004,6 +1052,7 @@ function onPcm(chunk){
   // this returned on !armed(), so the mute window was a total dead zone: a caller who answered
   // the moment the agent finished had their first words lost with no pre-roll to recover them.
   // Capture TRIGGERING still requires armed() — only the buffering runs early.
+  micFrames++;                       // proof of life for the startMic watchdog
   if(!listening){ return; }
   if(playing){
     if(!bargeOn){ return; }
@@ -1055,10 +1104,11 @@ function endTurn(){
   if(!qActive && audioQ.length) drainAudio();
   clearNoReply();
   const streamed = micStreamOpen; micStreamOpen=false;
-  const frames=speechFrames; speechFrames=[];
+  const frames=speechFrames;
   const durMs = frames.reduce((a,c)=>a+c.length,0)/srate*1000;
-  silentSamples=0; speechSamples=0; voicedSamples=0;
+  silentSamples=0; voicedSamples=0;
   if(durMs<MIN_SPEECH_MS){
+    speechFrames=[]; speechSamples=0;
     if(streamed) wsSend({type:'mic_abort'});   // server discards the partial buffer
     if(listening && !endingCall) armNoReply();
     return;
@@ -1066,13 +1116,21 @@ function endTurn(){
   noReplyCount=0;
   waitingForServer=true;
   setPill('transcribing');
-  if(turnsSent>0) scheduleFiller();
+  // Was gated on turnsSent>0, but the "(Call connected.)" trigger never increments it, so the
+  // caller's FIRST question — the one they judge responsiveness on — got no acknowledgement at
+  // all. scheduleFiller() already refuses to fire if the reply beat it or the call is ending.
+  scheduleFiller();
   turnsSent++;
   if(streamed && ws && ws.readyState===1){
-    pumpMicStream(true);                        // ship the tail
+    // Flush BEFORE clearing the buffer: speechFrames/speechSamples used to be zeroed above this
+    // line, so pumpMicStream saw nothing pending and the tail of every utterance was silently
+    // dropped instead of shipped.
+    pumpMicStream(true);
+    speechFrames=[]; speechSamples=0;
     wsSend({type:'mic_end', duration_ms:Math.round(durMs)});
     return;
   }
+  speechFrames=[]; speechSamples=0;
   let len=0; frames.forEach(f=>len+=f.length);
   const all=new Float32Array(len); let o=0; frames.forEach(f=>{all.set(f,o);o+=f.length;});
   const ds=downsample(all, srate, 16000);

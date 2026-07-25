@@ -445,21 +445,27 @@ STREAM_LLM = _clean("STREAM_LLM", "1").lower() not in ("0", "false", "no", "off"
 # This supersedes the whole-response hedge timer on the streaming path: a stall is visible at
 # the first token, so we no longer wait 3.5s of total silence to notice one. Same anti-burst
 # property as the staggered hedge (the backup only ever fires on a real stall).
-# 2500 is MEASURED, not guessed: healthy TTFT on this pool is ~1.25s (and it is fixed overhead —
-# a one-word reply costs the same as a full sentence), so the first value tried here, 1200ms,
-# fired the backup on EVERY turn. That doubled quota burn for nothing and fed the 429 pressure
-# that causes the tail stalls the hedge exists to cover in the first place.
+# MEASURED, not guessed. Healthy first-token on this pool is ~1.25-1.5s and it is FIXED overhead
+# (a one-word reply costs the same as a full sentence). 1200ms was tried first and fired the
+# backup on every single turn — doubling quota burn for nothing and feeding the very 429 pressure
+# the hedge exists to cover. 2500ms was the opposite problem: a stalled key held the caller for a
+# full 2.5s before anything else was tried. 1800 sits above the healthy band and still gets off a
+# bad key quickly. 1800 was then MEASURED and reverted: escalating that eagerly burns noticeably
+# more keys per minute, and on a rate-limited pool the extra 429s made p50 WORSE (english p50
+# 5.8s vs 2-3s at 2500) — the same trap simultaneous hedging fell into here once before. Racing
+# only looks free until the requests you add are the thing exhausting the pool.
 _TTFT_STALL_MS = max(250, _int_env("GEMINI_TTFT_STALL_MS", 2500))
 # Most streams a single turn may have IN FLIGHT at once. MEASURED constraint: a free-tier key
 # serves ~7 requests per MINUTE (verified — the 8th returns 429 whether it carries 10 tokens or
 # 4,500). Every extra racer therefore spends another key's minute-budget, which is the same
 # reason simultaneous hedging was measured harmful on this pool once before. 2 = one backup.
 _MAX_RACE = max(1, _int_env("GEMINI_MAX_RACE", 2))
-# …and the hard cap on how many keys ONE turn may consume in total. Without this the failure
-# path walked the whole 104-key pool inside its 7s budget, spending ~30 keys' minute-quota on a
-# single turn and guaranteeing the next turn failed too — a transient shortage turning itself
-# into a pool-wide outage. Give up gracefully after a handful instead; the pool stays healthy.
-_MAX_KEYS_PER_TURN = max(2, _int_env("GEMINI_MAX_KEYS_PER_TURN", 6))
+# …and the hard cap on how many keys ONE turn may consume in total, so a failing turn can't walk
+# the whole 104-key pool and spend everyone's minute-quota. A 429 comes back in ~200ms, so 20
+# keys still fits inside the deadline below and gives a real answer a genuine chance. This was
+# briefly set to 6, tuned against a test harness firing back-to-back turns — far too tight for a
+# single live caller, who then got a 7s "sorry, the line broke" while 90+ healthy keys sat idle.
+_MAX_KEYS_PER_TURN = max(2, _int_env("GEMINI_MAX_KEYS_PER_TURN", 20))
 # Hard ceiling on "no first token from ANY key". Without it, a turn where every raced stream
 # stalls waits out the httpx read timeout once per rotation — measured 24s of pure silence on a
 # quota-stressed pool, which is a dead call. At the ceiling we stop and let gemini_turn speak its
