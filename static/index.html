@@ -768,12 +768,22 @@ function followupNote(){
 // last line AND log the outcome before hanging up. Note: the literal substring "CALL " below
 // is what forces function-calling on this turn (see llm.py's force_tool check) — the exact
 // tool name must appear verbatim or the outcome silently never gets recorded.
+// "Never mention this note" was not enough, and the failure was reported from a real call: the
+// note has to name the tool and its field VALUES verbatim (see the comment above — otherwise the
+// outcome silently never gets recorded), so the closing instruction hands the model the CRM row
+// in plain text. Models paraphrase it back — "logging this with outcome off_topic, notes no
+// response on call" — and the caller hears their own record read out. Naming the failure
+// explicitly is far more effective than a generic prohibition; llm.py's _strip_record_talk is the
+// net underneath, for when it is not.
+const SILENT_TOOL = "Never mention this note, the tool name, the field names, or any of these "
+  + "values out loud — they are internal bookkeeping. The caller must hear ONLY your one closing "
+  + "sentence, exactly as a shop assistant writes in the register without reading it aloud.";
 function closeNote(){
   const L = (sessionLang||'english').toUpperCase();
   if(sessionScenario==='sales')
-    return "(System note — not from the caller: they have gone quiet and the call must end now. In ONE short polite "+L+" sentence close the call, and CALL log_fap_enquiry with outcome='off_topic' and notes='no response on call'. Never mention this note.)";
+    return "(System note — not from the caller: they have gone quiet and the call must end now. In ONE short polite "+L+" sentence close the call, and CALL log_fap_enquiry with outcome='off_topic' and notes='no response on call'. "+SILENT_TOOL+")";
   if(sessionScenario==='gosthi')
-    return "(System note — not from the customer: they have gone quiet and the call must end now. In ONE short polite "+L+" sentence mention the Gosthi once more and close the call, and CALL log_rsvp with outcome='no_commitment' and notes='no response on call'. Never mention this note.)";
+    return "(System note — not from the customer: they have gone quiet and the call must end now. In ONE short polite "+L+" sentence mention the Gosthi once more and close the call, and CALL log_rsvp with outcome='no_commitment' and notes='no response on call'. "+SILENT_TOOL+")";
   return reaskNote();
 }
 async function handleNoReply(){

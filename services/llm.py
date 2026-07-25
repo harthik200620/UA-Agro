@@ -498,11 +498,75 @@ _CLAUSE_HARD, _CLAUSE_SOFT = "।?!.…\n", ",;:—"
 _CLAUSE_MIN, _CLAUSE_SOFT_MIN, _CLAUSE_MAX = 12, 40, 90
 
 
+# RECORD TALK — the CRM row leaking into the caller's ear.
+#
+# The close-out prompt the client sends contains the record verbatim: "… CALL log_fap_enquiry
+# with outcome='off_topic' and notes='no response on call'". The pre-existing guard only strips a
+# parrot that KEEPS ITS PARENTHESES — `\(System[^)]*\)`. A model that paraphrases the instruction
+# without them (which is exactly what "reading out the note" looks like) sailed straight through
+# it and got spoken. Rule #3 now forbids this outright; this is the net under it, because a
+# prompt rule is a request and the caller hearing "outcome off_topic, notes no response on call"
+# is not a cosmetic defect.
+#
+# DELIBERATELY NARROW — it must never eat a legitimate line. "नोट कर लिया जी" and "I've noted it,
+# sir" are the real canned confirmations in _fallback_for, so bare "note"/"noted" is NOT a
+# pattern here; only unambiguous record machinery is.
+_RECORD_TALK = re.compile(
+    r"log_fap_enquiry|log_farmer_issue|log_rsvp|\bCRM\b"
+    r"|\b(?:outcome|notes|product_interest|guest_note)\s*[:=]"
+    # stems, not whole words: "saving" is sav+ing, "logging" is logg+ing — spelling the verbs out
+    # as save|log only ("save"+"ing") missed the most natural phrasing of all, "Saving it to the
+    # record now", which is exactly the sentence a model reaches for here.
+    r"|\b(?:record|logg|log|enter|save|sav|add)(?:ing|ed|s)?\s+(?:this|it|these|that|the\s+\w+)?\s*"
+    r"(?:in|into|to|onto)\s+(?:the\s+|our\s+|your\s+)?(?:system|crm|record|records|register|database|file)"
+    r"|सिस्टम\s*में|रिकॉर्ड\s*में|दर्ज\s*कर\s*(?:रहा|रही|रहे)",
+    re.IGNORECASE)
+
+# Sentence split that respects Devanagari danda as well as Latin terminators.
+_SENT_SPLIT = re.compile(r"(?<=[।?!.])\s+")
+
+
+def _strip_record_talk(s: str) -> str:
+    """Drop whole sentences that narrate the CRM record; keep everything else.
+
+    Sentence-level rather than whole-reply, so one leaked clause never costs the caller the
+    genuine answer sitting next to it."""
+    if not s or not _RECORD_TALK.search(s):
+        return s
+    kept = [p for p in _SENT_SPLIT.split(s) if p.strip() and not _RECORD_TALK.search(p)]
+    return " ".join(kept).strip()
+
+
+_WORD = re.compile(r"[\wऀ-ॿ]{3,}", re.UNICODE)
+
+
+def _echoes_record(spoken: str, args: dict | None) -> bool:
+    """Is this 'reply' just the CRM note restated as a sentence?
+
+    _RECORD_TALK catches the STRUCTURAL leak (field names, tool names). This catches the semantic
+    one: no give-away keywords, the model simply says the summary it is about to file — "किसान ने
+    डीएपी के बारे में पूछा, दो एकड़ ज़मीन" — which is the thing the caller should never hear.
+    Deliberately requires a substantial note and heavy overlap: a real reply naturally shares a
+    few words with the note (the product, the village), and losing a genuine answer would be far
+    worse than letting one summary through."""
+    note = " ".join(str((args or {}).get(k) or "") for k in ("notes", "description"))
+    want = {w.lower() for w in _WORD.findall(note)}
+    if len(want) < 5:
+        return False
+    have = {w.lower() for w in _WORD.findall(spoken or "")}
+    return len(want & have) / len(want) >= 0.7
+
+
 def _speakable(s: str) -> str:
     """The same sanitisation gemini_turn applies to the final text, applied per clause — so
-    what gets spoken early is always a prefix of what the turn ultimately returns."""
+    what gets spoken early is always a prefix of what the turn ultimately returns.
+
+    That prefix invariant is why _strip_record_talk MUST also run on gemini_turn's final text:
+    if streaming dropped a clause the final text kept, main.py's "what has the caller already
+    heard" comparison would diverge and re-synthesise the whole reply — making the caller hear
+    the leak TWICE instead of never."""
     s = re.sub(r"\(System[^)]*\)?", "", s or "")
-    return re.sub(r"\s+", " ", s).strip()
+    return _strip_record_talk(re.sub(r"\s+", " ", s).strip())
 
 
 def _next_clause(buf: str) -> tuple[str, str]:
@@ -890,6 +954,11 @@ async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: 
                 "name": name, "response": {"status": "success", "id": row.get("id")}}}]})
             own = re.sub(r"\(System[^)]*\)", "", "".join(text_chunks))
             own = re.sub(r"\s*\n+\s*", " ", own).strip()  # one spoken line, never split
+            own = _strip_record_talk(own)                 # never read the row back to the caller
+            # A same-turn line that merely RESTATES what is being filed is not a reply — it is
+            # the record wearing a sentence. Fall back to the proper confirmation instead.
+            if own and _echoes_record(own, args):
+                own = ""
             spoken = own if len(own) >= 8 else _fallback_for(name, args, lang)
             contents.append({"role": "model", "parts": [{"text": spoken}]})
             return spoken
@@ -899,6 +968,7 @@ async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: 
         # strip them so they are never shown or spoken to the customer.
         final = re.sub(r"\(System[^)]*\)", "", final)
         final = re.sub(r"\s*\n+\s*", " ", final).strip()  # one spoken line, never split
+        final = _strip_record_talk(final)                 # keep the prefix invariant _speakable relies on
         if not final:
             final = (
                 _fallback_for(last_tool, last_args, lang)
