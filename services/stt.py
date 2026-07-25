@@ -16,6 +16,7 @@ import struct
 import httpx
 
 from . import _http
+from . import sarvam_keys
 
 try:
     import websockets                     # ships with uvicorn[standard]; pinned in requirements
@@ -33,7 +34,6 @@ def _clean(name: str, default: str = "") -> str:
     return v.strip().strip('"').strip("'").strip()
 
 
-SARVAM_API_KEY = _clean("SARVAM_API_KEY")
 SARVAM_STT_MODEL = _clean("SARVAM_STT_MODEL", "saaras:v3")
 STT_URL = "https://api.sarvam.ai/speech-to-text"
 
@@ -45,31 +45,45 @@ _ATTEMPTS = [
 
 
 def stt_available() -> bool:
-    return bool(SARVAM_API_KEY)
+    return sarvam_keys.available()
 
 
 async def transcribe_wav(wav_bytes: bytes, language_code: str = "en-IN") -> str:
     """`language_code` is the caller's chosen language (en-IN / hi-IN / te-IN). Saaras code-mix
-    still understands English words mixed in; this just biases recognition to the right script."""
-    if not SARVAM_API_KEY:
+    still understands English words mixed in; this just biases recognition to the right script.
+
+    Walks the KEY pool outside the MODEL attempts: a usage-limited key fails identically on every
+    model, so re-trying models on a spent key would just burn the turn.
+    """
+    keys = sarvam_keys.order()
+    if not keys:
         raise RuntimeError("SARVAM_API_KEY not set")
 
-    headers = {"api-subscription-key": SARVAM_API_KEY}
     last_err = None
     client = _http.client()
-    for attempt in _ATTEMPTS:
-        files = {"file": ("turn.wav", wav_bytes, "audio/wav")}
-        data = {"model": attempt["model"], "language_code": language_code, **attempt["extra"]}
-        try:
-            resp = await client.post(STT_URL, headers=headers, files=files, data=data, timeout=30)
-            if resp.status_code >= 400:
-                last_err = f"Sarvam STT {resp.status_code} ({attempt['model']}): {resp.text[:300]}"
+    for key in keys:
+        rotate = False
+        for attempt in _ATTEMPTS:
+            files = {"file": ("turn.wav", wav_bytes, "audio/wav")}
+            data = {"model": attempt["model"], "language_code": language_code, **attempt["extra"]}
+            try:
+                resp = await client.post(STT_URL, headers={"api-subscription-key": key},
+                                         files=files, data=data, timeout=30)
+                if resp.status_code >= 400:
+                    last_err = f"Sarvam STT {resp.status_code} ({attempt['model']}): {resp.text[:300]}"
+                    if sarvam_keys.should_rotate(resp.status_code):
+                        sarvam_keys.mark_bad(key, resp.status_code)
+                        rotate = True          # this KEY is spent — the next model won't help
+                        break
+                    continue
+                sarvam_keys.mark_ok(key)
+                j = resp.json()
+                return (j.get("transcript") or "").strip()
+            except Exception as e:  # network / parse — try the next attempt
+                last_err = f"{type(e).__name__}: {e}"
                 continue
-            j = resp.json()
-            return (j.get("transcript") or "").strip()
-        except Exception as e:  # network / parse — try the next attempt
-            last_err = f"{type(e).__name__}: {e}"
-            continue
+        if not rotate:
+            break                              # failed for a reason another key won't fix
     raise RuntimeError(last_err or "Sarvam STT failed")
 
 
@@ -122,13 +136,14 @@ class SarvamStream:
         self.lang = language_code or "hi-IN"
         self.ok = False
         self._ws = None
+        self._key = ""
         self._opening: asyncio.Task | None = None
         self._reader: asyncio.Task | None = None
         self._parts: list[str] = []
         self._err = ""
 
     def usable(self) -> bool:
-        return bool(STREAM_STT and websockets and SARVAM_API_KEY)
+        return bool(STREAM_STT and websockets and sarvam_keys.available())
 
     def start(self) -> None:
         """Open the socket without blocking — the handshake overlaps the caller still speaking."""
@@ -137,7 +152,8 @@ class SarvamStream:
 
     async def _open(self) -> None:
         url = _WS_URL.format(model=SARVAM_STT_MODEL, lang=self.lang)
-        hdrs = {"Api-Subscription-Key": SARVAM_API_KEY}
+        self._key = sarvam_keys.current()
+        hdrs = {"Api-Subscription-Key": self._key}
         try:
             try:
                 conn = websockets.connect(url, additional_headers=hdrs, max_size=None)
@@ -145,7 +161,12 @@ class SarvamStream:
                 conn = websockets.connect(url, extra_headers=hdrs, max_size=None)
             self._ws = await asyncio.wait_for(conn, timeout=6)
         except Exception as exc:
-            self._ws, self._err = None, f"{type(exc).__name__}"
+            # A rejected upgrade carries the HTTP status; rotate off a spent key so the batch
+            # fallback below (and the next turn) start on a different one.
+            code = getattr(getattr(exc, "response", None), "status_code", 0) or 0
+            if sarvam_keys.should_rotate(code):
+                sarvam_keys.mark_bad(self._key, code)
+            self._ws, self._err = None, f"{type(exc).__name__} {code or ''}".strip()
             return
         self._reader = asyncio.ensure_future(self._read())
         self.ok = True
@@ -217,6 +238,8 @@ class SarvamStream:
             if self._parts and (loop.time() - last_change) >= quiet_s:
                 break
         await self._shut()
+        if self._parts:
+            sarvam_keys.mark_ok(self._key)
         return join_segments(self._parts)
 
     async def cancel(self) -> None:

@@ -25,6 +25,7 @@ except Exception:                         # absent → streaming TTS is simply u
     websockets = None                     # every reply falls back to the blocking HTTP synth
 
 from . import _http
+from . import sarvam_keys
 
 # Strip BOM / zero-width chars (U+FEFF, U+200B-U+200D) that dashboard bulk-pastes inject
 # and that str.strip() does NOT remove. Built via chr() so the source stays pure ASCII.
@@ -146,7 +147,6 @@ def _fix_pronunciation(text: str) -> str:
         text = rx.sub(repl, text)
     return text
 
-SARVAM_KEY = _clean("SARVAM_API_KEY")
 SARVAM_TTS_MODEL = _clean("SARVAM_TTS_MODEL", "bulbul:v2")
 SARVAM_TTS_SPEAKER = _clean("SARVAM_TTS_SPEAKER", "anushka")
 
@@ -180,7 +180,7 @@ def active_provider() -> str:
         return "none"
     if TTS_PROVIDER == "elevenlabs" and _eleven_ok:
         return "elevenlabs"
-    if SARVAM_KEY:
+    if sarvam_keys.available():
         return "sarvam"
     return "none"
 
@@ -285,23 +285,33 @@ _SARVAM_LANG = {"english": "en-IN", "hindi": "hi-IN", "telugu": "te-IN"}
 
 
 async def _sarvam(text: str, lang: str = "english") -> tuple[bytes | None, str | None]:
-    if not SARVAM_KEY:
+    keys = sarvam_keys.order()
+    if not keys:
         return None, None
     url = "https://api.sarvam.ai/text-to-speech"
-    headers = {"api-subscription-key": SARVAM_KEY, "Content-Type": "application/json"}
     body = {
         "inputs": [text[:480]],  # Bulbul caps input length
         "target_language_code": _SARVAM_LANG.get((lang or "").lower(), "en-IN"),
         "model": SARVAM_TTS_MODEL,
         "speaker": SARVAM_TTS_SPEAKER,
     }
-    resp = await _http.client().post(url, headers=headers, json=body)
-    resp.raise_for_status()
-    j = resp.json()
-    audios = j.get("audios") or []
-    if not audios:
-        return None, None
-    return base64.b64decode(audios[0]), "audio/wav"
+    last = None
+    for key in keys:
+        resp = await _http.client().post(
+            url, headers={"api-subscription-key": key, "Content-Type": "application/json"},
+            json=body)
+        if resp.status_code >= 400:
+            last = resp
+            if sarvam_keys.should_rotate(resp.status_code):
+                sarvam_keys.mark_bad(key, resp.status_code)   # usage limit — try the other key
+                continue
+            resp.raise_for_status()
+        sarvam_keys.mark_ok(key)
+        audios = resp.json().get("audios") or []
+        return (base64.b64decode(audios[0]), "audio/wav") if audios else (None, None)
+    if last is not None:
+        last.raise_for_status()
+    return None, None
 
 
 async def synthesize(text: str, lang: str = "english") -> tuple[bytes | None, str | None]:
@@ -323,7 +333,7 @@ async def synthesize(text: str, lang: str = "english") -> tuple[bytes | None, st
     # Telugu: prefer Sarvam Bulbul — faster than the slow eleven_v3 and native to the language
     # (also reads numbers/dates more cleanly). Only when a Sarvam key exists; else fall through
     # to ElevenLabs v3 as before.
-    if lng == "telugu" and TELUGU_TTS == "sarvam" and SARVAM_KEY:
+    if lng == "telugu" and TELUGU_TTS == "sarvam" and sarvam_keys.available():
         try:
             audio, mime = await _sarvam(text, lang)
             if audio:

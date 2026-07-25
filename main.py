@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import db
-from services import stt, tts, llm, directory
+from services import stt, tts, llm, directory, sarvam_keys
 from services.prompts import scenario_of, norm_lang, opener_for
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -77,6 +77,9 @@ async def config():
         "voice_detail": tts.eleven_reason(),
         "model": llm.GEMINI_MODEL,
         "llm_keys": llm.key_count(),
+        # Sarvam key pool health (never the keys themselves): "live" drops as keys hit their
+        # usage limit, so a glance at /config says whether a bad demo is quota or code.
+        "sarvam_keys": sarvam_keys.status(),
         # Which voice each language actually resolves to on THIS deploy — lets you verify a
         # voice change went live at a glance (GET /config), instead of guessing from audio.
         "voices": {
