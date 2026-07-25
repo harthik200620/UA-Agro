@@ -121,6 +121,23 @@ _RETRY_LINE = {
 _WARMED = False
 
 
+def _log(msg: str) -> None:
+    """Diagnostics must never be able to kill a call.
+
+    A plain print() of a Hindi transcript raises UnicodeEncodeError on a cp1252 console — and
+    because these lines sit INSIDE the turn handler, that exception propagated and closed the
+    WebSocket mid-call. Caught live: the socket dropped the moment a Devanagari filler arrived.
+    Vercel's log pipe is UTF-8, so the readable form is kept where it works and only the console
+    that cannot encode it gets escapes."""
+    try:
+        print(msg, flush=True)
+    except Exception:
+        try:
+            print(msg.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
+        except Exception:
+            pass
+
+
 def _pcm16_to_wav(pcm: bytes, sr: int = 16000) -> bytes:
     """Wrap raw mono 16-bit PCM (the streamed-mic frames) in a minimal WAV header."""
     import struct
@@ -469,12 +486,16 @@ def _split_for_tts(text: str) -> list[str]:
 # already "Yes please yes" going missing, so swallowing a genuine answer would be a far worse bug
 # than occasionally answering a filler. Nothing that could ever be an answer belongs in this set.
 _FILLERS = {
-    # non-lexical hesitation sounds
-    "um", "umm", "ummm", "uh", "uhh", "uhm", "er", "err", "erm", "hm", "hmm", "hmmm",
-    "mm", "mmm", "mhm", "ah", "aah", "ahh", "eh", "oh", "ooh",
-    "हम", "हम्म", "हूँ", "हूं", "अं", "उम", "एह", "आं", "अ",
+    # non-lexical hesitation sounds. Stored in REPEAT-COLLAPSED form (see _norm_tok): "ummmm",
+    # "हम्म्म" and "uhhh" all normalise onto the two-letter-run spelling, so the set does not have
+    # to enumerate every length the recogniser might emit — which is exactly how "umm" kept
+    # slipping through: Sarvam's spelling of a drawn-out hesitation is not stable.
+    "um", "umm", "uh", "uhh", "uhm", "hu", "huh", "er", "err", "erm", "hm", "hmm",
+    "mm", "mhm", "ahm", "ah", "aa", "aah", "eh", "ehh", "oh", "ooh", "uu", "mmh",
+    "हम", "हम्म", "हूँ", "हूं", "हूँम", "अं", "अँ", "अम", "अम्म", "उम", "उम्म", "एह", "आं", "आँ",
+    "अ", "आ", "म", "म्म", "ह", "हं", "हँ", "ओह", "अरे",
     # discourse markers that carry no answer on their own, in either script
-    "so", "well", "like", "actually", "i", "mean",
+    "so", "well", "like", "actually", "i", "mean", "just", "ya",
     "मतलब", "यानी", "वो", "वोह", "तो", "matlab", "yaani", "yani", "woh", "wo",
 }
 # NOT fillers, deliberately, and each one for a reason a test would not have told me:
@@ -511,15 +532,52 @@ _PENDING_MAX_AGE_S = 6.0
 
 
 def _is_incomplete(text: str) -> bool:
-    toks = re.findall(r"[\wऀ-ॿ]+", (text or "").lower())
-    return bool(toks) and len(toks) >= 2 and toks[-1] in _DANGLING
+    toks = _tokens(text)
+    return bool(toks) and len(toks) >= 2 and toks[-1] in _DANGLING_N
+
+
+_REPEATS = re.compile(r"(.)\1{2,}")
+
+
+def _norm_tok(t: str) -> str:
+    """Collapse a drawn-out sound onto a stable spelling: ummmm -> umm, हम्म्म -> हमम.
+
+    A hesitation is HELD, so the recogniser writes it at whatever length it heard. Matching exact
+    spellings meant the set had to guess every length, and the one the caller actually produced
+    was usually not in it — which is why "umm" was still being answered.
+    The virama strip is not cosmetic: "हम्म्म" is ह-म-्-म-्-म, so NO three identical characters
+    are ever adjacent and a plain repeat-collapse cannot see the repetition at all. Removing the
+    virama first turns it into "हममम", which then collapses like any other drawn-out sound."""
+    return _REPEATS.sub(r"\1\1", t.replace("्", ""))
+
+
+def _tokens(text: str) -> list[str]:
+    return [_norm_tok(t) for t in re.findall(r"[\wऀ-ॿ]+", (text or "").lower())]
+
+
+# Both sets are normalised ONCE with the same function the incoming tokens go through. Written
+# out longhand above for readability, compared in normalised form — otherwise "हम्म" in the set
+# would not even match itself after the virama strip.
+_FILLERS_N = {_norm_tok(w) for w in _FILLERS}
+_DANGLING_N = {_norm_tok(w) for w in _DANGLING}
 
 
 def _is_filler(text: str) -> bool:
-    toks = re.findall(r"[\wऀ-ॿ]+", (text or "").lower())
+    toks = _tokens(text)
     if not toks or len(toks) > _FILLER_MAX_TOKENS:
         return False
-    return all(t in _FILLERS for t in toks)
+    return all(t in _FILLERS_N for t in toks)
+
+
+def _ends_in_filler(text: str) -> bool:
+    """"मुझे चाहिए umm" — they are still thinking, not asking.
+
+    A hesitation at the END of an utterance means the sentence has not landed yet, whatever came
+    before it. Treat it like any other unfinished turn: hold it, and re-attach it to whatever they
+    say next. This is the case the plain filler check could never catch, because the utterance as a
+    whole is not filler — only its tail is."""
+    toks = _tokens(text)
+    return len(toks) >= 2 and toks[-1] in _FILLERS_N
 
 
 async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = False):
@@ -535,23 +593,47 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
     # Re-attach a fragment held from the previous turn ("I need DAP and" + "some urea" -> one
     # sentence). Without this the held half would simply be lost, which would be worse than
     # answering it early.
-    if not silent and state.get("pending_text"):
+    if state.get("pending_text"):
         held, when = state["pending_text"]
+        fresh = time.time() - when <= _PENDING_MAX_AGE_S
         state["pending_text"] = None
-        if time.time() - when <= _PENDING_MAX_AGE_S:
+        if fresh and not silent:
             text = f"{held} {text}".strip()
+        elif fresh and silent:
+            # The caller trailed off and then said nothing, so the client is about to nudge them
+            # with "are you still there?". Answer what they DID say instead — they were mid-thought
+            # and waiting on us, and asking them to repeat themselves would be the rudest possible
+            # response to having been patient with them.
+            text, silent = held, False
+            _log(f"[turn] held fragment timed out, answering it: {text[:60]!r}")
 
     # `state["contents"]` empty means this is the call-opening trigger, which is answered with the
     # greeting further down. Suppressing that because the caller happened to open with "hmm" would
     # start the call in total silence — never skip the opener.
     if not silent and state["contents"] and _is_filler(text):
+        _log(f"[turn] filler, not answered: {text[:60]!r}")
         await _send(ws, {"type": "status", "state": "idle", "detail": "filler"})
         return
-    # The caller stopped mid-sentence. Hold what they said, say nothing, and wait for the rest.
-    if not silent and state["contents"] and _is_incomplete(text):
-        state["pending_text"] = (text, time.time())
+    # The caller stopped mid-sentence — either on a dangling word ("…and") or on a hesitation
+    # ("…umm"). Hold what they said, say nothing, and wait for the rest.
+    if not silent and state["contents"] and (_is_incomplete(text) or _ends_in_filler(text)):
+        # Drop the trailing hesitation before holding — "मुझे चाहिए umm" + "दो बोरी" should reach
+        # the model as one clean sentence, not with the stammer wedged into the middle of it. A
+        # dangling conjunction is KEPT, because that one really does join the two halves.
+        keep = text
+        if _ends_in_filler(text):
+            words = text.split()
+            while words and _norm_tok(re.sub(r"[^\wऀ-ॿ]", "", words[-1].lower())) in _FILLERS_N:
+                words.pop()
+            keep = " ".join(words) or text
+        state["pending_text"] = (keep, time.time())
+        _log(f"[turn] incomplete, held: {text[:60]!r}")
         await _send(ws, {"type": "status", "state": "idle", "detail": "incomplete"})
         return
+    # The transcript the model actually receives. Without this, "it answered my umm" could only be
+    # guessed at from timings — and guessing is what made this take three rounds.
+    if not silent:
+        _log(f"[turn] answering: {text[:80]!r}")
     sid = state["session_id"]
     # End-of-speech timestamp when this turn came from the mic — the only honest zero point for
     # "how long until the caller hears something", since it includes STT.
